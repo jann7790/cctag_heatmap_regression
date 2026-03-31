@@ -23,14 +23,15 @@ Thumbs.db
 # Local tool state
 .claude/
 
-# Generated datasets and experiment outputs
+# Unified local outputs
+outputs/
+
+# Transition compatibility for historical paths
 tmp/
 2tmp/
 runs/
 results_ddp/
 results_ddp_010/
-
-# Synthetic dataset outputs
 *_dataset/
 *_dataset_*/
 generated_training_sets/
@@ -42,4 +43,3 @@ ultimate_dataset/
 # Generated images and previews
 broken.png
 covered.png
-

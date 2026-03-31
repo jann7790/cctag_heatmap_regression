@@ -13,8 +13,8 @@ Output structure:
     config.json   - generation parameters for reproducibility
 
 Usage:
-  python generate_cctag_dataset.py --num_images 50000 --output_dir ./cctag_dataset
-  python generate_cctag_dataset.py --num_images 100 --output_dir ./cctag_demo --visualize
+  python src/generate_cctag_dataset.py --num_images 50000 --output_dir ./outputs/datasets/cctag_dataset
+  python src/generate_cctag_dataset.py --num_images 100 --output_dir ./outputs/datasets/cctag_demo --visualize
 """
 
 import argparse
@@ -130,7 +130,15 @@ def validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> 
 
 @lru_cache(maxsize=None)
 def load_cctag_markers(rings_count: int) -> list[list[int]]:
-    marker_file = SCRIPT_DIR / "CCTag" / "markersToPrint" / "generators" / f"cctag{rings_count}.txt"
+    marker_file = (
+        SCRIPT_DIR.parent
+        / "assets"
+        / "markers"
+        / "CCTag"
+        / "markersToPrint"
+        / "generators"
+        / f"cctag{rings_count}.txt"
+    )
     markers = []
     with open(marker_file, "r", encoding="utf-8") as f:
         for line in f:
@@ -1456,13 +1464,13 @@ def main():
     )
     parser.add_argument("--num_images", type=int, default=50000,
                         help="Number of images to generate (default: 50000)")
-    parser.add_argument("--output_dir", type=str, default="./cctag_dataset",
+    parser.add_argument("--output_dir", type=str, default="./outputs/datasets/cctag_dataset",
                         help="Output directory")
     parser.add_argument("--output_size", type=parse_output_size, default=(128, 128),
                         help="Output image size. Use a single integer for square output or WIDTHxHEIGHT, e.g. 1920x1200.")
     parser.add_argument("--marker_style", type=str, default="cctag_source",
                         choices=["cctag_source", "classic", "reference"],
-                        help="Marker style. 'cctag_source' matches CCTag/display_marker.py.")
+                        help="Marker style. 'cctag_source' matches assets/markers/CCTag/display_marker.py.")
     parser.add_argument("--marker_id", type=int, default=0,
                         help="Marker ID from the CCTag source table (default: 0)")
     parser.add_argument("--num_rings", type=int, default=3, choices=[3, 4, 5],

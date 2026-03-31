@@ -2,12 +2,12 @@
 set -euo pipefail
 
 PYTHON_BIN="${PYTHON_BIN:-python3}"
-GENERATOR_SCRIPT="${GENERATOR_SCRIPT:-./generate_training_sets.sh}"
-TRAIN_SCRIPT="${TRAIN_SCRIPT:-./train_cctag_heatmap.py}"
+GENERATOR_SCRIPT="${GENERATOR_SCRIPT:-./scripts/generate_training_sets.sh}"
+TRAIN_SCRIPT="${TRAIN_SCRIPT:-./src/train_cctag_heatmap.py}"
 
-TRAINING_ROOT="${TRAINING_ROOT:-./generated_training_sets}"
+TRAINING_ROOT="${TRAINING_ROOT:-./outputs/training_sets/generated_training_sets}"
 MIXED_DATASET_DIR="${MIXED_DATASET_DIR:-${TRAINING_ROOT}/mixed_train_dataset}"
-RUN_OUTPUT_DIR="${RUN_OUTPUT_DIR:-./runs/experiment_mixed}"
+RUN_OUTPUT_DIR="${RUN_OUTPUT_DIR:-./outputs/runs/experiment_mixed}"
 
 merge_dataset_parts() {
   local merged_dir="$1"

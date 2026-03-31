@@ -4,10 +4,10 @@ Inference script for CCTagNet heatmap model.
 
 Example:
   # single image
-  python infer_cctag_heatmap.py --checkpoint ./runs/experiment_01/best.pt --input image.png
+  python src/infer_cctag_heatmap.py --checkpoint ./outputs/runs/experiment_01/best.pt --input ./assets/samples/cctag_reallife.png
 
   # directory of images (saves heatmaps and prints centers)
-  python infer_cctag_heatmap.py --checkpoint ./runs/experiment_01/best.pt --input ./images/ --output ./results/
+  python src/infer_cctag_heatmap.py --checkpoint ./outputs/runs/experiment_01/best.pt --input ./outputs/testing/small_testing/images --output ./outputs/inference/results_demo
 """
 from __future__ import annotations
 
@@ -104,9 +104,62 @@ class CCTagNet(nn.Module):
         )
 
 
+class CCTagNetV3(nn.Module):
+    """U-Net style CCTagNet with skip connections (used by experiment_mixed_v3)."""
+
+    SKIP_INDICES = (1, 2, 3, 4)
+
+    def __init__(self, heatmap_size: tuple[int, int]) -> None:
+        super().__init__()
+        efficientnet_b0, EfficientNet_B0_Weights = ensure_torchvision()
+        backbone = efficientnet_b0(weights=None)
+        self.encoder = backbone.features
+        self.heatmap_height, self.heatmap_width = heatmap_size
+        self.dec1 = self._dec_block(1280 + 80, 256)
+        self.dec2 = self._dec_block(256 + 40, 128)
+        self.dec3 = self._dec_block(128 + 24, 64)
+        self.dec4 = self._dec_block(64 + 16, 32)
+        self.head = nn.Sequential(nn.Conv2d(32, 1, kernel_size=1), nn.Sigmoid())
+
+    @staticmethod
+    def _dec_block(in_ch: int, out_ch: int) -> nn.Sequential:
+        return nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+        )
+
+    def _encode(self, x: torch.Tensor) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        skips: list[torch.Tensor] = []
+        for i, layer in enumerate(self.encoder):
+            x = layer(x)
+            if i in self.SKIP_INDICES:
+                skips.append(x)
+        return x, skips  # x=1280ch; skips=[16ch, 24ch, 40ch, 80ch]
+
+    @staticmethod
+    def _up_cat(x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
+        x = nn.functional.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False)
+        if x.shape[2:] != skip.shape[2:]:
+            skip = nn.functional.interpolate(skip, size=x.shape[2:], mode="bilinear", align_corners=False)
+        return torch.cat([x, skip], dim=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        bottleneck, (s16, s24, s40, s80) = self._encode(x)
+        x = self.dec1(self._up_cat(bottleneck, s80))
+        x = self.dec2(self._up_cat(x, s40))
+        x = self.dec3(self._up_cat(x, s24))
+        x = self.dec4(self._up_cat(x, s16))
+        x = self.head(x)
+        return nn.functional.interpolate(
+            x, size=(self.heatmap_height, self.heatmap_width),
+            mode="bilinear", align_corners=False,
+        )
+
+
 # ── helpers ───────────────────────────────────────────────────────────────────
 
-def load_model(checkpoint_path: Path, device: torch.device) -> tuple[CCTagNet, dict]:
+def load_model(checkpoint_path: Path, device: torch.device) -> tuple[nn.Module, dict]:
     try:
         with torch.serialization.safe_globals([PosixPath]):
             ckpt = torch.load(checkpoint_path, map_location=device, weights_only=True)
@@ -116,7 +169,10 @@ def load_model(checkpoint_path: Path, device: torch.device) -> tuple[CCTagNet, d
         ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     config = ckpt.get("config", {})
     heatmap_size = (config.get("heatmap_height", 100), config.get("heatmap_width", 160))
-    model = CCTagNet(heatmap_size=heatmap_size).to(device)
+    if "dec1.0.weight" in ckpt["model_state_dict"]:
+        model = CCTagNetV3(heatmap_size=heatmap_size).to(device)
+    else:
+        model = CCTagNet(heatmap_size=heatmap_size).to(device)
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
     return model, config

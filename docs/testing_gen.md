@@ -38,9 +38,9 @@
   4. test_extreme_mix
      綜合最難版，拿來看 overall robustness。
 
-  python3 generate_cctag_dataset.py \
+  python3 src/generate_cctag_dataset.py \
     --num_images 1000 \
-    --output_dir ./testing_small_hard \
+    --output_dir ./outputs/testing/testing_small_hard \
     --output_size 640x400 \
     --seed 101 \
     --marker_min 40 \
@@ -54,9 +54,9 @@
     --boundary_target_ratio 0.20
 
 
-  python3 generate_cctag_dataset.py \
+  python3 src/generate_cctag_dataset.py \
     --num_images 1000 \
-    --output_dir ./testing_boundary_hard \
+    --output_dir ./outputs/testing/testing_boundary_hard \
     --output_size 640x400 \
     --seed 102 \
     --marker_min 66 \
@@ -71,9 +71,9 @@
 
 
 
-  python3 generate_cctag_dataset.py \
+  python3 src/generate_cctag_dataset.py \
     --num_images 1000 \
-    --output_dir ./testing_negative_hard \
+    --output_dir ./outputs/testing/testing_negative_hard \
     --output_size 640x400 \
     --seed 103 \
     --marker_min 66 \
@@ -85,9 +85,9 @@
     --empty_negative_ratio 0.35 \
     --boundary_target_ratio 0.20
 
-  python3 generate_cctag_dataset.py \
+  python3 src/generate_cctag_dataset.py \
     --num_images 1000 \
-    --output_dir ./testing_extreme_mix \
+    --output_dir ./outputs/testing/testing_extreme_mix \
     --output_size 640x400 \
     --seed 104 \
     --marker_min 40 \

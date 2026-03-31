@@ -2,8 +2,8 @@
 set -euo pipefail
 
 PYTHON_BIN="${PYTHON_BIN:-python3}"
-GENERATOR="${GENERATOR:-./generate_cctag_dataset.py}"
-OUTPUT_ROOT="${OUTPUT_ROOT:-./generated_testing_suites}"
+GENERATOR="${GENERATOR:-./src/generate_cctag_dataset.py}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-./outputs/testing/generated_testing_suites}"
 TEST_COUNT="${TEST_COUNT:-1000}"
 
 common_args=(

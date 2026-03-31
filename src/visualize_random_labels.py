@@ -18,7 +18,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--dataset_dir",
         type=Path,
-        default=Path("/home/user/dataset/cctag_dataset_yolo"),
+        default=Path("./outputs/datasets/cctag_dataset"),
         help="Dataset root containing images/, labels_yolo/, and optional labels.csv.",
     )
     parser.add_argument(
@@ -36,7 +36,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path("/home/user/dataset/cctag_dataset_yolo/random_label_check.jpg"),
+        default=Path("./outputs/tmp/random_label_check.jpg"),
         help="Path to save the visualization grid.",
     )
     parser.add_argument(

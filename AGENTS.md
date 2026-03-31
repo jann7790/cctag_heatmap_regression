@@ -1,21 +1,25 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-This repository is centered on two Python entry points at the root:
+This repository separates source code, workflow scripts, docs, assets, and local outputs:
 
-- `generate_cctag_dataset.py`: generates synthetic CCTag images, heatmaps, YOLO labels, and metadata.
-- `visualize_random_labels.py`: samples a generated dataset and draws center points, ellipses, and optional YOLO boxes for inspection.
+- `src/`: Python entry points such as `generate_cctag_dataset.py`, `visualize_random_labels.py`, training scripts, and inference scripts.
+- `scripts/`: shell workflows for generating training/testing suites and combined generate+train runs.
+- `docs/`: working notes and repo organization docs.
+- `assets/markers/CCTag/`: reference marker assets, especially `markersToPrint/generators/`.
+- `assets/samples/`: sample marker images kept for inspection or demos.
+- `outputs/`: all generated datasets, training runs, inference results, and temp outputs.
 
-Reference marker assets live under `CCTag/`, especially `CCTag/markersToPrint/generators/`. Generated artifacts should go to dataset folders such as `cctag_dataset_yolo/` or temporary work directories like `tmp/`; treat these as outputs, not source.
+Generated artifacts should go under `outputs/`, not the repo root.
 
 ## Build, Test, and Development Commands
 Use Python 3.11+ in a local virtual environment with OpenCV and NumPy installed.
 
-- `python generate_cctag_dataset.py --num_images 100 --output_dir ./tmp/demo --visualize`
+- `python src/generate_cctag_dataset.py --num_images 100 --output_dir ./outputs/datasets/demo --visualize`
   Creates a small reproducible dataset and preview image.
-- `python visualize_random_labels.py --dataset_dir ./tmp/demo --num_samples 10 --show_yolo_bbox`
+- `python src/visualize_random_labels.py --dataset_dir ./outputs/datasets/demo --num_samples 10 --show_yolo_bbox --output ./outputs/tmp/demo_labels.jpg`
   Produces a visual QC grid for random samples.
-- `python -m py_compile generate_cctag_dataset.py visualize_random_labels.py`
+- `python -m py_compile src/generate_cctag_dataset.py src/visualize_random_labels.py`
   Fast syntax smoke test before submitting changes.
 
 ## Coding Style & Naming Conventions
@@ -32,7 +36,7 @@ There is no formal test suite yet. Validate changes with focused script runs ins
 - Run `py_compile` first.
 - Generate a small dataset with a fixed seed, for example `--num_images 20 --seed 42`.
 - Inspect the output contract: `images/`, `heatmaps/`, `labels_yolo/`, `labels.csv`, and `config.json`.
-- Use `visualize_random_labels.py` to confirm label alignment before merging.
+- Use `src/visualize_random_labels.py` to confirm label alignment before merging.
 
 ## Commit & Pull Request Guidelines
 The available history is minimal (`init`, `Switch data encoding...`), so prefer short imperative commit subjects, for example `Add ellipse label visualization`.

@@ -19,13 +19,13 @@
 from __future__ import annotations
 
 """
-Train an EfficientNet-B0 heatmap regressor on ./cctag_dataset.
+Train an EfficientNet-B0 heatmap regressor on a dataset under ./outputs/.
 
 Required packages:
   pip install torch torchvision opencv-python numpy
 
 Example:
-  python train_cctag_heatmap.py --dataset_dir ./cctag_dataset --epochs 10 --batch_size 8
+  python src/train_cctag_heatmap.py --dataset_dir ./outputs/datasets/cctag_dataset --epochs 10 --batch_size 8
 """
 
 import argparse
@@ -55,13 +55,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--dataset_dir",
         type=Path,
-        default=Path("./cctag_dataset"),
+        default=Path("./outputs/datasets/cctag_dataset"),
         help="Dataset root containing images/, heatmaps/, and labels.csv.",
     )
     parser.add_argument(
         "--output_dir",
         type=Path,
-        default=Path("./runs/cctag_heatmap"),
+        default=Path("./outputs/runs/cctag_heatmap"),
         help="Directory for checkpoints and training logs.",
     )
     parser.add_argument(

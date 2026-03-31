@@ -4,20 +4,20 @@
   - 黃色斜十字：heatmap peak
   - 左上角文字：檔名、heatmap 最大值、occlusion ratio
 
-  我已經直接幫你跑了一張檢查圖，輸出在 tmp/cctag_dataset_640_400_heatmap_overlay.jpg。
+  我已經直接幫你跑了一張檢查圖，輸出在 outputs/tmp/cctag_dataset_640_400_heatmap_overlay.jpg。
 
   之後你自己可用這個指令重跑：
 
-  python visualize_random_heatmaps.py \
-    --dataset_dir ./cctag_dataset_640_400 \
+  python src/visualize_random_heatmaps.py \
+    --dataset_dir ./outputs/datasets/cctag_dataset_640_400 \
     --num_samples 9 \
     --seed 42 \
-    --output ./tmp/cctag_dataset_640_400_heatmap_overlay.jpg
+    --output ./outputs/tmp/cctag_dataset_640_400_heatmap_overlay.jpg
 
 
-python train_cctag_heatmap.py \
-    --dataset_dir ./blur_dataset \
-    --output_dir ./runs/experiment_01 \
+python src/train_cctag_heatmap.py \
+    --dataset_dir ./outputs/datasets/blur_dataset \
+    --output_dir ./outputs/runs/experiment_01 \
     --epochs 30 \
     --batch_size 16 \
     --lr 1e-3 \

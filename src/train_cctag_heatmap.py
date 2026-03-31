@@ -2,21 +2,19 @@
 from __future__ import annotations
 
 """
-Train an EfficientNet-B0 heatmap regressor with DistributedDataParallel.
+Train an EfficientNet-B0 heatmap regressor on a dataset under ./outputs/.
 
-Examples:
-  torchrun --nproc_per_node=4 train_cctag_heatmap_ddp.py \
-    --dataset_dir ./generated_training_sets/mixed_train_dataset \
-    --output_dir ./runs/experiment_mixed_ddp \
-    --epochs 80 \
-    --batch_size 18
+Required packages:
+  pip install torch torchvision opencv-python numpy
+
+Example:
+  python src/train_cctag_heatmap.py --dataset_dir ./outputs/datasets/cctag_dataset --epochs 10 --batch_size 8
 """
 
 import argparse
 import csv
 import json
 import math
-import os
 import random
 import sys
 import time
@@ -26,56 +24,36 @@ from typing import Any
 import cv2
 import numpy as np
 import torch
-import torch.distributed as dist
 import torch.nn as nn
-from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, Dataset, Subset
-from torch.utils.data.distributed import DistributedSampler
 
 
 IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(3, 1, 1)
 IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(3, 1, 1)
 
 
-def spatial_soft_argmax(heatmap: torch.Tensor, temperature: float = 0.1) -> torch.Tensor:
-    """Differentiable soft-argmax returning (x, y) in heatmap pixel coords."""
-    B, _, H, W = heatmap.shape
-    flat = heatmap.view(B, -1) / temperature
-    weights = torch.softmax(flat, dim=1).view(B, H, W)
-    x_coords = torch.arange(W, dtype=torch.float32, device=heatmap.device)
-    y_coords = torch.arange(H, dtype=torch.float32, device=heatmap.device)
-    exp_x = (weights.sum(dim=1) * x_coords).sum(dim=1)
-    exp_y = (weights.sum(dim=2) * y_coords).sum(dim=1)
-    return torch.stack([exp_x, exp_y], dim=1)
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Train an EfficientNet-B0 heatmap regressor for synthetic CCTag localization with DDP."
+        description="Train an EfficientNet-B0 heatmap regressor for synthetic CCTag localization."
     )
     parser.add_argument(
         "--dataset_dir",
         type=Path,
-        default=Path("./cctag_dataset"),
+        default=Path("./outputs/datasets/cctag_dataset"),
         help="Dataset root containing images/, heatmaps/, and labels.csv.",
     )
     parser.add_argument(
         "--output_dir",
         type=Path,
-        default=Path("./runs/cctag_heatmap_ddp"),
+        default=Path("./outputs/runs/cctag_heatmap"),
         help="Directory for checkpoints and training logs.",
     )
     parser.add_argument("--epochs", type=int, default=20, help="Number of training epochs.")
-    parser.add_argument(
-        "--batch_size",
-        type=int,
-        default=8,
-        help="Per-process mini-batch size. Global batch = batch_size * world_size.",
-    )
+    parser.add_argument("--batch_size", type=int, default=8, help="Mini-batch size.")
     parser.add_argument("--lr", type=float, default=1e-3, help="Initial learning rate.")
     parser.add_argument("--weight_decay", type=float, default=1e-4, help="AdamW weight decay.")
     parser.add_argument("--train_ratio", type=float, default=0.9, help="Train split ratio.")
-    parser.add_argument("--num_workers", type=int, default=4, help="DataLoader worker count per process.")
+    parser.add_argument("--num_workers", type=int, default=4, help="DataLoader worker count.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
     parser.add_argument("--input_width", type=int, default=640, help="Resized input width.")
     parser.add_argument("--input_height", type=int, default=400, help="Resized input height.")
@@ -86,16 +64,22 @@ def parse_args() -> argparse.Namespace:
         help="Save a checkpoint every N epochs in addition to best/last.",
     )
     parser.add_argument(
-        "--backend",
-        type=str,
-        default=None,
-        help="Distributed backend. Defaults to nccl on CUDA and gloo on CPU.",
-    )
-    parser.add_argument(
         "--device",
         type=str,
         default=None,
-        help="Single-process fallback device, e.g. cpu, cuda, cuda:0.",
+        help="Override device, e.g. cpu, cuda, cuda:0. Defaults to CUDA when available.",
+    )
+    parser.add_argument(
+        "--gpus",
+        type=str,
+        default=None,
+        help="Comma-separated GPU IDs for DataParallel, e.g. 0,1,2. Overrides --device when set.",
+    )
+    parser.add_argument(
+        "--continue_training",
+        type=Path,
+        default=None,
+        help="Resume training from a checkpoint path such as last.pt or best.pt.",
     )
     return parser.parse_args()
 
@@ -118,7 +102,7 @@ def set_seed(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
-def resolve_single_process_device(device_arg: str | None) -> torch.device:
+def resolve_device(device_arg: str | None) -> torch.device:
     if device_arg:
         return torch.device(device_arg)
     if torch.cuda.is_available():
@@ -130,29 +114,6 @@ def tensor_to_float(value: torch.Tensor | float) -> float:
     if isinstance(value, torch.Tensor):
         return float(value.detach().cpu().item())
     return float(value)
-
-
-def is_dist_ready() -> bool:
-    return dist.is_available() and dist.is_initialized()
-
-
-def is_main_process() -> bool:
-    return not is_dist_ready() or dist.get_rank() == 0
-
-
-def reduce_mean(value: float, device: torch.device) -> float:
-    tensor = torch.tensor(value, dtype=torch.float64, device=device)
-    if is_dist_ready():
-        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
-        tensor /= dist.get_world_size()
-    return float(tensor.item())
-
-
-def reduce_sum(value: float, device: torch.device) -> float:
-    tensor = torch.tensor(value, dtype=torch.float64, device=device)
-    if is_dist_ready():
-        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
-    return float(tensor.item())
 
 
 class CCTagHeatmapDataset(Dataset[dict[str, Any]]):
@@ -277,93 +238,48 @@ class HeatmapDiceLoss(nn.Module):
 
 
 class CombinedHeatmapLoss(nn.Module):
-    def __init__(self, center_weight: float = 0.1) -> None:
+    def __init__(self) -> None:
         super().__init__()
         self.bce = nn.BCELoss()
         self.dice = HeatmapDiceLoss()
-        self.center_weight = center_weight
 
-    def forward(
-        self,
-        prediction: torch.Tensor,
-        target: torch.Tensor,
-        heatmap_centers: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        heatmap_loss = 0.5 * self.bce(prediction, target) + 0.5 * self.dice(prediction, target)
-        if heatmap_centers is not None:
-            pred_centers = spatial_soft_argmax(prediction)
-            center_loss = nn.functional.smooth_l1_loss(pred_centers, heatmap_centers)
-            return heatmap_loss + self.center_weight * center_loss
-        return heatmap_loss
+    def forward(self, prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        return 0.5 * self.bce(prediction, target) + 0.5 * self.dice(prediction, target)
 
 
 class CCTagNet(nn.Module):
-    """EfficientNet-B0 encoder with U-Net style skip connections.
-
-    Skip taps from encoder stages (channel counts for B0):
-        features[1] → 16ch, stride 2
-        features[2] → 24ch, stride 4
-        features[3] → 40ch, stride 8
-        features[4] → 80ch, stride 16
-    Bottleneck (features[8]) → 1280ch, stride 32
-    """
-
-    SKIP_INDICES = (1, 2, 3, 4)
-    SKIP_CHANNELS = (16, 24, 40, 80)
-
     def __init__(self, heatmap_size: tuple[int, int]) -> None:
         super().__init__()
         efficientnet_b0, EfficientNet_B0_Weights = ensure_torchvision()
         backbone = efficientnet_b0(weights=EfficientNet_B0_Weights.DEFAULT)
         self.encoder = backbone.features
         self.heatmap_height, self.heatmap_width = heatmap_size
-
-        # Decoder: 4 upsample stages with skip-connection concatenation
-        # stage 1: up 32→16, cat features[4] (80ch)
-        self.dec1 = self._dec_block(1280 + 80, 256)
-        # stage 2: up 16→8,  cat features[3] (40ch)
-        self.dec2 = self._dec_block(256 + 40, 128)
-        # stage 3: up 8→4,   cat features[2] (24ch)
-        self.dec3 = self._dec_block(128 + 24, 64)
-        # stage 4: up 4→2,   cat features[1] (16ch)
-        self.dec4 = self._dec_block(64 + 16, 32)
-
-        self.head = nn.Sequential(nn.Conv2d(32, 1, kernel_size=1), nn.Sigmoid())
-
-    @staticmethod
-    def _dec_block(in_ch: int, out_ch: int) -> nn.Sequential:
-        return nn.Sequential(
-            nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1),
-            nn.BatchNorm2d(out_ch),
+        self.decoder = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
+            nn.Conv2d(1280, 256, kernel_size=3, padding=1),
+            nn.BatchNorm2d(256),
             nn.ReLU(inplace=True),
+            nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
+            nn.Conv2d(256, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
+            nn.Conv2d(128, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
+            nn.Conv2d(64, 32, kernel_size=3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 1, kernel_size=1),
+            nn.Sigmoid(),
         )
 
-    def _encode(self, x: torch.Tensor) -> tuple[torch.Tensor, list[torch.Tensor]]:
-        skips: list[torch.Tensor] = []
-        for i, layer in enumerate(self.encoder):
-            x = layer(x)
-            if i in self.SKIP_INDICES:
-                skips.append(x)
-        return x, skips  # x=1280ch; skips=[16ch, 24ch, 40ch, 80ch]
-
-    @staticmethod
-    def _up_cat(x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
-        x = nn.functional.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False)
-        if x.shape[2:] != skip.shape[2:]:
-            skip = nn.functional.interpolate(skip, size=x.shape[2:], mode="bilinear", align_corners=False)
-        return torch.cat([x, skip], dim=1)
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        bottleneck, (s16, s24, s40, s80) = self._encode(x)
-
-        x = self.dec1(self._up_cat(bottleneck, s80))
-        x = self.dec2(self._up_cat(x, s40))
-        x = self.dec3(self._up_cat(x, s24))
-        x = self.dec4(self._up_cat(x, s16))
-        x = self.head(x)
-
+        features = self.encoder(x)
+        prediction = self.decoder(features)
         return nn.functional.interpolate(
-            x,
+            prediction,
             size=(self.heatmap_height, self.heatmap_width),
             mode="bilinear",
             align_corners=False,
@@ -391,61 +307,38 @@ def split_dataset(dataset: Dataset[Any], train_ratio: float, seed: int) -> tuple
 
 def create_dataloaders(
     args: argparse.Namespace,
-    rank: int,
-    world_size: int,
-) -> tuple[DataLoader[Any], DataLoader[Any], int, tuple[int, int], DistributedSampler[Any] | None]:
+) -> tuple[DataLoader[Any], DataLoader[Any], int, tuple[int, int]]:
     dataset = CCTagHeatmapDataset(
         dataset_dir=args.dataset_dir,
         input_size=(args.input_width, args.input_height),
     )
     train_set, val_set = split_dataset(dataset, args.train_ratio, args.seed)
 
-    train_sampler = None
-    val_sampler = None
-    if world_size > 1:
-        train_sampler = DistributedSampler(
-            train_set,
-            num_replicas=world_size,
-            rank=rank,
-            shuffle=True,
-            drop_last=False,
-        )
-        val_sampler = DistributedSampler(
-            val_set,
-            num_replicas=world_size,
-            rank=rank,
-            shuffle=False,
-            drop_last=False,
-        )
-
     train_loader = DataLoader(
         train_set,
         batch_size=args.batch_size,
-        shuffle=train_sampler is None,
-        sampler=train_sampler,
+        shuffle=True,
         num_workers=args.num_workers,
         pin_memory=torch.cuda.is_available(),
         drop_last=False,
-        persistent_workers=args.num_workers > 0,
     )
     val_loader = DataLoader(
         val_set,
         batch_size=args.batch_size,
         shuffle=False,
-        sampler=val_sampler,
         num_workers=args.num_workers,
         pin_memory=torch.cuda.is_available(),
         drop_last=False,
-        persistent_workers=args.num_workers > 0,
     )
     if dataset.heatmap_height is None or dataset.heatmap_width is None:
         raise ValueError("Failed to infer heatmap size from dataset")
-    return train_loader, val_loader, len(dataset), (dataset.heatmap_height, dataset.heatmap_width), train_sampler
+    return train_loader, val_loader, len(dataset), (dataset.heatmap_height, dataset.heatmap_width)
 
 
 def decode_heatmap_centers(heatmaps: torch.Tensor) -> torch.Tensor:
-    batch_size, _, _height, width = heatmaps.shape
-    hm = heatmaps.squeeze(1)
+    """Sub-pixel center extraction via 2nd-order Taylor expansion around the argmax peak."""
+    batch_size, _, height, width = heatmaps.shape
+    hm = heatmaps.squeeze(1)  # [B, H, W]
 
     flat_indices = hm.view(batch_size, -1).argmax(dim=1)
     py = torch.div(flat_indices, width, rounding_mode="floor")
@@ -456,14 +349,14 @@ def decode_heatmap_centers(heatmaps: torch.Tensor) -> torch.Tensor:
     py_p = py + 1
     b = torch.arange(batch_size, device=hm.device)
 
-    p11 = padded[b, py_p, px_p]
-    p10 = padded[b, py_p, px_p - 1]
-    p12 = padded[b, py_p, px_p + 1]
-    p01 = padded[b, py_p - 1, px_p]
-    p21 = padded[b, py_p + 1, px_p]
+    p11 = padded[b, py_p,     px_p    ]
+    p10 = padded[b, py_p,     px_p - 1]
+    p12 = padded[b, py_p,     px_p + 1]
+    p01 = padded[b, py_p - 1, px_p    ]
+    p21 = padded[b, py_p + 1, px_p    ]
 
-    dx = 0.5 * (p12 - p10)
-    dy = 0.5 * (p21 - p01)
+    dx  = 0.5 * (p12 - p10)
+    dy  = 0.5 * (p21 - p01)
     dxx = p12 - 2.0 * p11 + p10
     dyy = p21 - 2.0 * p11 + p01
     dxy = 0.25 * (
@@ -486,11 +379,12 @@ def decode_heatmap_centers(heatmaps: torch.Tensor) -> torch.Tensor:
     return torch.stack((px.float() + delta_x, py.float() + delta_y), dim=1)
 
 
-def compute_center_distance_sum(
+
+def compute_center_l2_px(
     prediction: torch.Tensor,
     target_centers_px: torch.Tensor,
     input_size: tuple[int, int],
-) -> tuple[float, int]:
+) -> float:
     pred_centers = decode_heatmap_centers(prediction)
     input_width, input_height = input_size
     heatmap_height, heatmap_width = prediction.shape[-2:]
@@ -500,7 +394,7 @@ def compute_center_distance_sum(
     pred_centers_px[:, 0] *= scale_x
     pred_centers_px[:, 1] *= scale_y
     distances = torch.linalg.norm(pred_centers_px - target_centers_px, dim=1)
-    return float(distances.sum().detach().cpu().item()), int(distances.numel())
+    return float(distances.mean().detach().cpu().item())
 
 
 def train_one_epoch(
@@ -517,11 +411,10 @@ def train_one_epoch(
     for batch in loader:
         images = batch["image"].to(device, non_blocking=True)
         targets = batch["heatmap"].to(device, non_blocking=True)
-        heatmap_centers = batch["heatmap_center"].to(device, non_blocking=True)
 
         optimizer.zero_grad(set_to_none=True)
         predictions = model(images)
-        loss = criterion(predictions, targets, heatmap_centers=heatmap_centers)
+        loss = criterion(predictions, targets)
         loss.backward()
         optimizer.step()
 
@@ -529,9 +422,7 @@ def train_one_epoch(
         running_loss += tensor_to_float(loss) * batch_size
         sample_count += batch_size
 
-    total_loss = reduce_sum(running_loss, device)
-    total_count = reduce_sum(float(sample_count), device)
-    return total_loss / max(total_count, 1.0)
+    return running_loss / max(sample_count, 1)
 
 
 @torch.no_grad()
@@ -544,7 +435,7 @@ def validate(
 ) -> tuple[float, float]:
     model.eval()
     running_loss = 0.0
-    running_center_distance = 0.0
+    running_center_error = 0.0
     sample_count = 0
 
     for batch in loader:
@@ -554,18 +445,15 @@ def validate(
 
         predictions = model(images)
         loss = criterion(predictions, targets)
-        center_distance_sum, distance_count = compute_center_distance_sum(predictions, centers, input_size)
+        center_error = compute_center_l2_px(predictions, centers, input_size)
 
         batch_size = images.size(0)
         running_loss += tensor_to_float(loss) * batch_size
-        running_center_distance += center_distance_sum
-        sample_count += distance_count
+        running_center_error += center_error * batch_size
+        sample_count += batch_size
 
-    total_loss = reduce_sum(running_loss, device)
-    total_center_distance = reduce_sum(running_center_distance, device)
-    total_count = reduce_sum(float(sample_count), device)
-    avg_loss = total_loss / max(total_count, 1.0)
-    avg_center_error = total_center_distance / max(total_count, 1.0)
+    avg_loss = running_loss / max(sample_count, 1)
+    avg_center_error = running_center_error / max(sample_count, 1)
     return avg_loss, avg_center_error
 
 
@@ -573,19 +461,13 @@ def save_checkpoint(
     checkpoint_path: Path,
     model: nn.Module,
     optimizer: torch.optim.Optimizer,
-    scheduler: torch.optim.lr_scheduler.LRScheduler,
+    scheduler: torch.optim.lr_scheduler.ReduceLROnPlateau,
     epoch: int,
     best_val_loss: float,
     args: argparse.Namespace,
-    world_size: int,
 ) -> None:
-    if not is_main_process():
-        return
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-    if isinstance(model, DistributedDataParallel):
-        state_dict = model.module.state_dict()
-    else:
-        state_dict = model.state_dict()
+    state_dict = model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict()
     torch.save(
         {
             "epoch": epoch,
@@ -593,10 +475,30 @@ def save_checkpoint(
             "optimizer_state_dict": optimizer.state_dict(),
             "scheduler_state_dict": scheduler.state_dict(),
             "best_val_loss": best_val_loss,
-            "config": {**vars(args), "world_size": world_size},
+            "config": vars(args),
         },
         checkpoint_path,
     )
+
+
+def load_checkpoint(
+    checkpoint_path: Path,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler.ReduceLROnPlateau,
+    device: torch.device,
+) -> tuple[int, float]:
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    state_dict = checkpoint["model_state_dict"]
+    if isinstance(model, nn.DataParallel):
+        model.module.load_state_dict(state_dict)
+    else:
+        model.load_state_dict(state_dict)
+    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+    start_epoch = int(checkpoint.get("epoch", 0)) + 1
+    best_val_loss = float(checkpoint.get("best_val_loss", math.inf))
+    return start_epoch, best_val_loss
 
 
 def write_run_config(
@@ -607,10 +509,7 @@ def write_run_config(
     val_size: int,
     device: torch.device,
     heatmap_size: tuple[int, int],
-    world_size: int,
 ) -> None:
-    if not is_main_process():
-        return
     output_dir.mkdir(parents=True, exist_ok=True)
     config = {
         "dataset_dir": str(args.dataset_dir),
@@ -622,14 +521,12 @@ def write_run_config(
         "heatmap_width": heatmap_size[1],
         "heatmap_height": heatmap_size[0],
         "epochs": args.epochs,
-        "batch_size_per_process": args.batch_size,
-        "global_batch_size": args.batch_size * world_size,
+        "batch_size": args.batch_size,
         "lr": args.lr,
         "weight_decay": args.weight_decay,
         "train_ratio": args.train_ratio,
         "seed": args.seed,
         "device": str(device),
-        "world_size": world_size,
     }
     (output_dir / "run_config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
 
@@ -643,8 +540,6 @@ def append_metrics_row(
     lr: float,
     duration_sec: float,
 ) -> None:
-    if not is_main_process():
-        return
     is_new = not metrics_path.exists()
     with metrics_path.open("a", encoding="utf-8", newline="") as handle:
         writer = csv.writer(handle)
@@ -665,8 +560,6 @@ def append_metrics_row(
 
 
 def preview_batch(loader: DataLoader[Any]) -> None:
-    if not is_main_process():
-        return
     batch = next(iter(loader))
     images = batch["image"]
     heatmaps = batch["heatmap"]
@@ -682,73 +575,38 @@ def preview_batch(loader: DataLoader[Any]) -> None:
     )
 
 
-def setup_distributed(args: argparse.Namespace) -> tuple[int, int, int, torch.device]:
-    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
-        rank = int(os.environ["RANK"])
-        world_size = int(os.environ["WORLD_SIZE"])
-        local_rank = int(os.environ.get("LOCAL_RANK", 0))
-        backend = args.backend or ("nccl" if torch.cuda.is_available() else "gloo")
-        if backend == "nccl" and not torch.cuda.is_available():
-            raise RuntimeError("NCCL backend requires CUDA, but CUDA is not available.")
-        if torch.cuda.is_available():
-            torch.cuda.set_device(local_rank)
-            device = torch.device("cuda", local_rank)
-        else:
-            device = torch.device("cpu")
-        dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
-        return rank, world_size, local_rank, device
-
-    device = resolve_single_process_device(args.device)
-    return 0, 1, 0, device
-
-
-def cleanup_distributed() -> None:
-    if is_dist_ready():
-        dist.destroy_process_group()
-
-
-def build_model(heatmap_size: tuple[int, int], device: torch.device, rank: int, world_size: int) -> nn.Module:
-    # Rank 0 loads pretrained weights first so other ranks can reuse the local cache.
-    if world_size > 1 and rank != 0:
-        dist.barrier()
-    model = CCTagNet(heatmap_size=heatmap_size).to(device)
-    if world_size > 1 and rank == 0:
-        dist.barrier()
-    if world_size > 1:
-        model = DistributedDataParallel(
-            model,
-            device_ids=[device.index] if device.type == "cuda" else None,
-            output_device=device.index if device.type == "cuda" else None,
-        )
-    return model
-
-
 def main() -> None:
     args = parse_args()
-    rank, world_size, _local_rank, device = setup_distributed(args)
-    set_seed(args.seed + rank)
+    set_seed(args.seed)
 
-    train_loader, val_loader, dataset_size, heatmap_size, train_sampler = create_dataloaders(
-        args,
-        rank=rank,
-        world_size=world_size,
-    )
+    gpu_ids: list[int] = []
+    if args.gpus is not None:
+        gpu_ids = [int(g.strip()) for g in args.gpus.split(",") if g.strip()]
+        device = torch.device(f"cuda:{gpu_ids[0]}")
+    else:
+        device = resolve_device(args.device)
+
+    train_loader, val_loader, dataset_size, heatmap_size = create_dataloaders(args)
     train_size = len(train_loader.dataset)
     val_size = len(val_loader.dataset)
 
     preview_batch(train_loader)
 
-    model = build_model(heatmap_size=heatmap_size, device=device, rank=rank, world_size=world_size)
-    criterion = CombinedHeatmapLoss().to(device)
+    model = CCTagNet(heatmap_size=heatmap_size).to(device)
+    if gpu_ids and len(gpu_ids) > 1:
+        model = nn.DataParallel(model, device_ids=gpu_ids)
+        print(f"using DataParallel on GPUs: {gpu_ids}")
+    criterion = CombinedHeatmapLoss()
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=args.lr,
         weight_decay=args.weight_decay,
     )
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
-        T_max=args.epochs,
-        eta_min=1e-6,
+        mode="min",
+        factor=0.5,
+        patience=2,
     )
 
     write_run_config(
@@ -759,23 +617,32 @@ def main() -> None:
         val_size=val_size,
         device=device,
         heatmap_size=heatmap_size,
-        world_size=world_size,
     )
     metrics_path = args.output_dir / "metrics.csv"
 
+    start_epoch = 1
     best_val_loss = math.inf
-    if is_main_process():
+    if args.continue_training is not None:
+        if not args.continue_training.is_file():
+            raise FileNotFoundError(f"Checkpoint not found: {args.continue_training}")
+        start_epoch, best_val_loss = load_checkpoint(
+            checkpoint_path=args.continue_training,
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            device=device,
+        )
         print(
-            f"training on {device} | world_size={world_size} | "
-            f"samples={dataset_size} train={train_size} val={val_size} "
-            f"input={args.input_width}x{args.input_height} heatmap={heatmap_size[1]}x{heatmap_size[0]} "
-            f"per_gpu_batch={args.batch_size} global_batch={args.batch_size * world_size}"
+            f"resumed from {args.continue_training} "
+            f"at epoch {start_epoch - 1} with best_val_loss={best_val_loss:.6f}"
         )
 
-    for epoch in range(1, args.epochs + 1):
-        if train_sampler is not None:
-            train_sampler.set_epoch(epoch)
+    print(
+        f"training on {device} | samples={dataset_size} train={train_size} val={val_size} "
+        f"input={args.input_width}x{args.input_height} heatmap={heatmap_size[1]}x{heatmap_size[0]}"
+    )
 
+    for epoch in range(start_epoch, args.epochs + 1):
         start_time = time.time()
         train_loss = train_one_epoch(model, train_loader, optimizer, criterion, device)
         val_loss, center_l2_px = validate(
@@ -785,7 +652,7 @@ def main() -> None:
             device,
             input_size=(args.input_width, args.input_height),
         )
-        scheduler.step()
+        scheduler.step(val_loss)
         duration_sec = time.time() - start_time
         current_lr = optimizer.param_groups[0]["lr"]
 
@@ -806,7 +673,6 @@ def main() -> None:
             epoch=epoch,
             best_val_loss=best_val_loss,
             args=args,
-            world_size=world_size,
         )
 
         if epoch % args.save_every == 0:
@@ -818,7 +684,6 @@ def main() -> None:
                 epoch=epoch,
                 best_val_loss=best_val_loss,
                 args=args,
-                world_size=world_size,
             )
 
         if val_loss < best_val_loss:
@@ -831,27 +696,21 @@ def main() -> None:
                 epoch=epoch,
                 best_val_loss=best_val_loss,
                 args=args,
-                world_size=world_size,
             )
 
-        if is_main_process():
-            print(
-                f"epoch {epoch:03d}/{args.epochs:03d} "
-                f"train_loss={train_loss:.6f} "
-                f"val_loss={val_loss:.6f} "
-                f"center_l2_px={center_l2_px:.3f} "
-                f"lr={current_lr:.6g} "
-                f"time={duration_sec:.1f}s"
-            )
-
-    cleanup_distributed()
+        print(
+            f"epoch {epoch:03d}/{args.epochs:03d} "
+            f"train_loss={train_loss:.6f} "
+            f"val_loss={val_loss:.6f} "
+            f"center_l2_px={center_l2_px:.3f} "
+            f"lr={current_lr:.6g} "
+            f"time={duration_sec:.1f}s"
+        )
 
 
 if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        if is_main_process():
-            print("training interrupted", file=sys.stderr)
-        cleanup_distributed()
+        print("training interrupted", file=sys.stderr)
         raise SystemExit(130)
