@@ -1,0 +1,45 @@
+# Python cache and local environments
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+.python-version
+.venv/
+venv/
+env/
+ENV/
+
+# Editor and OS files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Local tool state
+.claude/
+
+# Generated datasets and experiment outputs
+tmp/
+2tmp/
+runs/
+results_ddp/
+results_ddp_010/
+
+# Synthetic dataset outputs
+*_dataset/
+*_dataset_*/
+generated_training_sets/
+generated_testing_suites/
+testing_*/
+small_testing/
+ultimate_dataset/
+
+# Generated images and previews
+broken.png
+covered.png
+
