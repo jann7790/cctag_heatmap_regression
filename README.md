@@ -27,20 +27,108 @@
 - 本機生成內容只放在 `outputs/`。
 - 根目錄不再直接放 `*_dataset/`、`runs/`、`results_*` 這類工作產物。
 
-## Setup
+## Environment Management
 
-使用 Python 3.11+，先安裝依賴：
+這個 repo 現在以 `uv + pyproject.toml` 為主要依賴管理方式，並固定使用 Python `3.12.11`。
+
+- `.python-version`：指定標準 Python 版本。
+- `pyproject.toml`：唯一的主要依賴來源。
+- `requirements/*.txt`：保留給舊流程或純 `pip` 使用的相容檔。
+- `uv.lock`：鎖定實際解析出的完整依賴樹，讓不同機器重建出一致環境。
+
+### 如果你以前都用 requirements.txt
+
+可以先用這個心智模型理解：
+
+- `requirements.txt`：你手寫「想裝什麼」。
+- `pip freeze`：把「目前環境實際裝了什麼」全部列出來。
+- `pyproject.toml`：新版的主要依賴定義檔，比 `requirements.txt` 更完整。
+- `uv.lock`：比 `pip freeze` 更適合提交到 repo 的鎖檔。
+- `uv sync`：依照 `pyproject.toml` 和 `uv.lock` 建立一致環境。
+
+`pip freeze` 會輸出目前 virtualenv 內已安裝套件的精確版本，例如：
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
+pip freeze
+```
+
+可能會得到：
+
+```text
+numpy==2.4.3
+opencv-python==4.13.0.92
+torch==2.11.0+cu126
+torchvision==0.26.0+cu126
+```
+
+但它有兩個限制：
+
+- 它描述的是「現在這個環境碰巧裝了什麼」，不一定是你真正想維護的最小依賴集合。
+- 它常會把很多間接依賴一起寫出來，久了會很難整理。
+
+以前常見流程是：
+
+```bash
 pip install -r requirements.txt
+pip freeze > requirements.txt
+```
+
+現在比較建議：
+
+```bash
+uv sync --extra cu126
+```
+
+然後把依賴需求維護在 `pyproject.toml`，把實際鎖定結果交給 `uv.lock`。
+
+### 常用對照
+
+- 建 venv + 安裝依賴：
+  以前 `python -m venv .venv && pip install -r requirements.txt`
+  現在 `uv sync --extra cu126`
+- 重建一模一樣的環境：
+  以前通常靠 `requirements.txt`
+  現在靠 `uv.lock`
+- 查看目前裝了什麼：
+  以前 `pip freeze`
+  現在可用 `uv pip freeze`
+
+建議做法：
+
+```bash
+uv sync --extra cu126
+```
+
+如果這台機器沒有可用 CUDA，改用 CPU 版本：
+
+```bash
+uv sync --extra cpu
+```
+
+也可以用 bootstrap script：
+
+```bash
+bash scripts/bootstrap_env.sh
+```
+
+如果你還是要沿用 `pip`：
+
+```bash
+python3.12 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements/cu126.txt
+```
+
+或 CPU 版：
+
+```bash
+pip install -r requirements/cpu.txt
 ```
 
 快速語法檢查：
 
 ```bash
-python -m py_compile \
+uv run python -m py_compile \
   src/generate_cctag_dataset.py \
   src/visualize_random_labels.py \
   src/train_cctag_heatmap.py \
@@ -51,7 +139,7 @@ python -m py_compile \
 ## Generate Dataset
 
 ```bash
-python src/generate_cctag_dataset.py \
+uv run python src/generate_cctag_dataset.py \
   --num_images 100 \
   --output_dir ./outputs/datasets/demo_small_testing \
   --output_size 640x400 \
@@ -78,7 +166,7 @@ python src/generate_cctag_dataset.py \
 ## Visualize Labels
 
 ```bash
-python src/visualize_random_labels.py \
+uv run python src/visualize_random_labels.py \
   --dataset_dir ./outputs/datasets/demo_small_testing \
   --num_samples 10 \
   --show_yolo_bbox \
@@ -90,7 +178,7 @@ python src/visualize_random_labels.py \
 單機 DataParallel：
 
 ```bash
-python src/train_cctag_heatmap.py \
+uv run python src/train_cctag_heatmap.py \
   --dataset_dir ./outputs/datasets/ultimate_dataset \
   --output_dir ./outputs/runs/experiment_03 \
   --epochs 80 \
@@ -109,7 +197,7 @@ python src/train_cctag_heatmap.py \
 DDP：
 
 ```bash
-torchrun --nproc_per_node=4 src/train_cctag_heatmap_ddp.py \
+uv run torchrun --nproc_per_node=4 src/train_cctag_heatmap_ddp.py \
   --dataset_dir ./outputs/training_sets/generated_training_sets/mixed_train_dataset \
   --output_dir ./outputs/runs/experiment_mixed_ddp \
   --epochs 80 \
@@ -126,7 +214,7 @@ torchrun --nproc_per_node=4 src/train_cctag_heatmap_ddp.py \
 資料夾推論 + heatmap + overlay + evaluation：
 
 ```bash
-python src/infer_cctag_heatmap.py \
+uv run python src/infer_cctag_heatmap.py \
   --checkpoint ./outputs/runs/experiment_mixed_ddp/best.pt \
   --input ./outputs/testing/small_testing/images \
   --output ./outputs/inference/results_ddp \
@@ -137,7 +225,7 @@ python src/infer_cctag_heatmap.py \
 另一個 checkpoint：
 
 ```bash
-python src/infer_cctag_heatmap.py \
+uv run python src/infer_cctag_heatmap.py \
   --checkpoint ./outputs/runs/experiment_mixed_ddp/epoch_010.pt \
   --input ./outputs/testing/small_testing/images \
   --output ./outputs/inference/results_ddp_010 \
@@ -148,7 +236,7 @@ python src/infer_cctag_heatmap.py \
 單張圖片：
 
 ```bash
-python src/infer_cctag_heatmap.py \
+uv run python src/infer_cctag_heatmap.py \
   --checkpoint ./outputs/runs/experiment_01/best.pt \
   --input ./assets/samples/cctag_reallife.png \
   --output ./outputs/inference/reallife_demo \

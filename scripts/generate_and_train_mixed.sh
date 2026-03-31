@@ -1,7 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PYTHON_BIN="${PYTHON_BIN:-python3}"
+if [[ -z "${PYTHON_BIN:-}" ]]; then
+  if [[ -x "./.venv/bin/python" ]]; then
+    PYTHON_BIN="./.venv/bin/python"
+  else
+    PYTHON_BIN="python3"
+  fi
+fi
 GENERATOR_SCRIPT="${GENERATOR_SCRIPT:-./scripts/generate_training_sets.sh}"
 TRAIN_SCRIPT="${TRAIN_SCRIPT:-./src/train_cctag_heatmap.py}"
 

@@ -1,0 +1,56 @@
+[build-system]
+requires = ["hatchling>=1.27.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "cctag-synthetic-workspace"
+version = "0.1.0"
+description = "Synthetic CCTag dataset generation, training, and inference workspace."
+readme = "README.md"
+requires-python = "==3.12.11"
+dependencies = [
+    "numpy==2.4.3",
+    "opencv-python==4.13.0.92",
+]
+
+[project.optional-dependencies]
+cpu = [
+    "torch==2.11.0",
+    "torchvision==0.26.0",
+]
+cu126 = [
+    "torch==2.11.0+cu126",
+    "torchvision==0.26.0+cu126",
+]
+
+[dependency-groups]
+dev = []
+
+[tool.uv]
+package = false
+conflicts = [
+    [
+        { extra = "cpu" },
+        { extra = "cu126" },
+    ],
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cpu", extra = "cpu" },
+    { index = "pytorch-cu126", extra = "cu126" },
+]
+torchvision = [
+    { index = "pytorch-cpu", extra = "cpu" },
+    { index = "pytorch-cu126", extra = "cu126" },
+]
