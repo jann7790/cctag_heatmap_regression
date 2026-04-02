@@ -226,9 +226,18 @@ uv run python src/infer_cctag_heatmap.py \
 
 ```bash
 uv run python src/infer_cctag_heatmap.py \
-  --checkpoint ./outputs/runs/experiment_mixed_ddp/epoch_010.pt \
+  --checkpoint ./outputs/runs/experiment_mixed_v4/best.pt \
   --input ./outputs/testing/small_testing/images \
-  --output ./outputs/inference/results_ddp_010 \
+  --output ./outputs/inference/results \
+  --vis \
+  --eval
+```
+
+```bash
+uv run python src/infer_cctag_heatmap.py \
+  --checkpoint ./outputs/runs/experiment_mixed_v4/best.pt \
+  --input assets/samples/cctag_reallife.png \
+  --output ./outputs/inference/results \
   --vis \
   --eval
 ```
