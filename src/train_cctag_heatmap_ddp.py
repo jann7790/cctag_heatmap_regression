@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 """
-Train an EfficientNet-B0 heatmap regressor with DistributedDataParallel.
+Train a backbone-selectable heatmap regressor with DistributedDataParallel.
 
 Examples:
   torchrun --nproc_per_node=4 src/train_cctag_heatmap_ddp.py \
@@ -15,6 +15,7 @@ Examples:
 import argparse
 import csv
 import json
+import logging
 import math
 import os
 import random
@@ -51,7 +52,7 @@ def spatial_soft_argmax(heatmap: torch.Tensor, temperature: float = 0.1) -> torc
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Train an EfficientNet-B0 heatmap regressor for synthetic CCTag localization with DDP."
+        description="Train a heatmap regressor for synthetic CCTag localization with DDP."
     )
     parser.add_argument(
         "--dataset_dir",
@@ -97,6 +98,13 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Single-process fallback device, e.g. cpu, cuda, cuda:0.",
     )
+    parser.add_argument(
+        "--backbone",
+        type=str,
+        default="efficientnet_b0",
+        choices=["efficientnet_b0", "mobilenet_v3_small", "resnet18"],
+        help="Backbone architecture (default: efficientnet_b0).",
+    )
     return parser.parse_args()
 
 
@@ -109,6 +117,28 @@ def ensure_torchvision() -> tuple[Any, Any]:
             "Install it with: pip install torchvision"
         ) from exc
     return efficientnet_b0, EfficientNet_B0_Weights
+
+
+def ensure_mobilenet_v3_small() -> tuple[Any, Any]:
+    try:
+        from torchvision.models import MobileNet_V3_Small_Weights, mobilenet_v3_small
+    except ImportError as exc:
+        raise SystemExit(
+            "torchvision is required for MobileNetV3-Small.\n"
+            "Install it with: pip install torchvision"
+        ) from exc
+    return mobilenet_v3_small, MobileNet_V3_Small_Weights
+
+
+def ensure_resnet18() -> tuple[Any, Any]:
+    try:
+        from torchvision.models import ResNet18_Weights, resnet18
+    except ImportError as exc:
+        raise SystemExit(
+            "torchvision is required for ResNet-18.\n"
+            "Install it with: pip install torchvision"
+        ) from exc
+    return resnet18, ResNet18_Weights
 
 
 def set_seed(seed: int) -> None:
@@ -377,6 +407,142 @@ class CCTagNet(nn.Module):
         )
 
 
+class CCTagNetMobileV3(nn.Module):
+    """MobileNetV3-Small encoder with U-Net style skip connections.
+
+    Skip taps from encoder stages (channel counts for MobileNetV3-Small):
+        features[0] → 16ch, stride 2
+        features[1] → 16ch, stride 4
+        features[3] → 24ch, stride 8
+        features[8] → 48ch, stride 16
+    Bottleneck (features[12]) → 576ch, stride 32
+    """
+
+    SKIP_INDICES = (0, 1, 3, 8)
+    SKIP_CHANNELS = (16, 16, 24, 48)
+    BOTTLENECK_CHANNELS = 576
+
+    def __init__(self, heatmap_size: tuple[int, int]) -> None:
+        super().__init__()
+        mobilenet_v3_small, MobileNet_V3_Small_Weights = ensure_mobilenet_v3_small()
+        backbone = mobilenet_v3_small(weights=MobileNet_V3_Small_Weights.DEFAULT)
+        self.encoder = backbone.features
+        self.heatmap_height, self.heatmap_width = heatmap_size
+
+        self.dec1 = self._dec_block(self.BOTTLENECK_CHANNELS + 48, 128)
+        self.dec2 = self._dec_block(128 + 24, 64)
+        self.dec3 = self._dec_block(64 + 16, 32)
+        self.dec4 = self._dec_block(32 + 16, 16)
+        self.head = nn.Sequential(nn.Conv2d(16, 1, kernel_size=1), nn.Sigmoid())
+
+    @staticmethod
+    def _dec_block(in_ch: int, out_ch: int) -> nn.Sequential:
+        return nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+        )
+
+    def _encode(self, x: torch.Tensor) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        skips: list[torch.Tensor] = []
+        for i, layer in enumerate(self.encoder):
+            x = layer(x)
+            if i in self.SKIP_INDICES:
+                skips.append(x)
+        return x, skips  # x=576ch; skips=[16ch, 16ch, 24ch, 48ch]
+
+    @staticmethod
+    def _up_cat(x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
+        x = nn.functional.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False)
+        if x.shape[2:] != skip.shape[2:]:
+            skip = nn.functional.interpolate(skip, size=x.shape[2:], mode="bilinear", align_corners=False)
+        return torch.cat([x, skip], dim=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        bottleneck, (s16_s2, s16_s4, s24, s48) = self._encode(x)
+        x = self.dec1(self._up_cat(bottleneck, s48))
+        x = self.dec2(self._up_cat(x, s24))
+        x = self.dec3(self._up_cat(x, s16_s4))
+        x = self.dec4(self._up_cat(x, s16_s2))
+        x = self.head(x)
+        return nn.functional.interpolate(
+            x, size=(self.heatmap_height, self.heatmap_width),
+            mode="bilinear", align_corners=False,
+        )
+
+
+class CCTagNetResNet18(nn.Module):
+    """ResNet-18 encoder with U-Net style skip connections.
+
+    Skip taps:
+        relu(conv1) → 64ch, stride 2
+        layer1 → 64ch, stride 4
+        layer2 → 128ch, stride 8
+        layer3 → 256ch, stride 16
+    Bottleneck (layer4) → 512ch, stride 32
+    """
+
+    def __init__(self, heatmap_size: tuple[int, int]) -> None:
+        super().__init__()
+        resnet18, ResNet18_Weights = ensure_resnet18()
+        backbone = resnet18(weights=ResNet18_Weights.DEFAULT)
+        self.stem = nn.Sequential(
+            backbone.conv1,
+            backbone.bn1,
+            backbone.relu,
+        )
+        self.maxpool = backbone.maxpool
+        self.layer1 = backbone.layer1
+        self.layer2 = backbone.layer2
+        self.layer3 = backbone.layer3
+        self.layer4 = backbone.layer4
+        self.heatmap_height, self.heatmap_width = heatmap_size
+
+        self.dec1 = self._dec_block(512 + 256, 256)
+        self.dec2 = self._dec_block(256 + 128, 128)
+        self.dec3 = self._dec_block(128 + 64, 64)
+        self.dec4 = self._dec_block(64 + 64, 32)
+        self.head = nn.Sequential(nn.Conv2d(32, 1, kernel_size=1), nn.Sigmoid())
+
+    @staticmethod
+    def _dec_block(in_ch: int, out_ch: int) -> nn.Sequential:
+        return nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+        )
+
+    @staticmethod
+    def _up_cat(x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
+        x = nn.functional.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False)
+        if x.shape[2:] != skip.shape[2:]:
+            skip = nn.functional.interpolate(skip, size=x.shape[2:], mode="bilinear", align_corners=False)
+        return torch.cat([x, skip], dim=1)
+
+    def _encode(self, x: torch.Tensor) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
+        s64_s2 = self.stem(x)
+        x = self.maxpool(s64_s2)
+        s64_s4 = self.layer1(x)
+        s128_s8 = self.layer2(s64_s4)
+        s256_s16 = self.layer3(s128_s8)
+        bottleneck = self.layer4(s256_s16)
+        return bottleneck, (s64_s2, s64_s4, s128_s8, s256_s16)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        bottleneck, (s64_s2, s64_s4, s128_s8, s256_s16) = self._encode(x)
+        x = self.dec1(self._up_cat(bottleneck, s256_s16))
+        x = self.dec2(self._up_cat(x, s128_s8))
+        x = self.dec3(self._up_cat(x, s64_s4))
+        x = self.dec4(self._up_cat(x, s64_s2))
+        x = self.head(x)
+        return nn.functional.interpolate(
+            x,
+            size=(self.heatmap_height, self.heatmap_width),
+            mode="bilinear",
+            align_corners=False,
+        )
+
+
 def split_dataset(dataset: Dataset[Any], train_ratio: float, seed: int) -> tuple[Subset[Any], Subset[Any]]:
     if not 0.0 < train_ratio < 1.0:
         raise ValueError(f"--train_ratio must be between 0 and 1, got {train_ratio}")
@@ -510,6 +676,29 @@ def compute_center_distance_sum(
     return float(distances.sum().detach().cpu().item()), int(distances.numel())
 
 
+def compute_detection_counts(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    peak_threshold: float = 0.5,
+) -> tuple[int, int, int, int]:
+    pred_peak = prediction.flatten(1).max(dim=1).values
+    gt_peak = target.flatten(1).max(dim=1).values
+    pred_has_object = pred_peak >= peak_threshold
+    gt_has_object = gt_peak > 0.1
+
+    tp = int(torch.logical_and(gt_has_object, pred_has_object).sum().detach().cpu().item())
+    fp = int(torch.logical_and(torch.logical_not(gt_has_object), pred_has_object).sum().detach().cpu().item())
+    fn = int(torch.logical_and(gt_has_object, torch.logical_not(pred_has_object)).sum().detach().cpu().item())
+    tn = int(torch.logical_and(torch.logical_not(gt_has_object), torch.logical_not(pred_has_object)).sum().detach().cpu().item())
+    return tp, fp, fn, tn
+
+
+def safe_divide(numerator: float, denominator: float) -> float:
+    if denominator == 0.0:
+        return 0.0
+    return numerator / denominator
+
+
 def train_one_epoch(
     model: nn.Module,
     loader: DataLoader[Any],
@@ -548,11 +737,16 @@ def validate(
     criterion: nn.Module,
     device: torch.device,
     input_size: tuple[int, int],
-) -> tuple[float, float]:
+) -> dict[str, float]:
     model.eval()
     running_loss = 0.0
     running_center_distance = 0.0
     sample_count = 0
+    positive_count = 0
+    tp_det = 0
+    fp_det = 0
+    fn_det = 0
+    tn_det = 0
 
     for batch in loader:
         images = batch["image"].to(device, non_blocking=True)
@@ -561,19 +755,47 @@ def validate(
 
         predictions = model(images)
         loss = criterion(predictions, targets)
-        center_distance_sum, distance_count = compute_center_distance_sum(predictions, centers, input_size)
+        pos_mask = targets.flatten(1).max(dim=1).values > 0.1
+        center_distance_sum = 0.0
+        center_distance_count = 0
+        if pos_mask.any():
+            center_distance_sum, center_distance_count = compute_center_distance_sum(
+                predictions[pos_mask],
+                centers[pos_mask],
+                input_size,
+            )
+        batch_tp, batch_fp, batch_fn, batch_tn = compute_detection_counts(predictions, targets)
 
         batch_size = images.size(0)
         running_loss += tensor_to_float(loss) * batch_size
         running_center_distance += center_distance_sum
-        sample_count += distance_count
+        sample_count += batch_size
+        positive_count += center_distance_count
+        tp_det += batch_tp
+        fp_det += batch_fp
+        fn_det += batch_fn
+        tn_det += batch_tn
 
     total_loss = reduce_sum(running_loss, device)
     total_center_distance = reduce_sum(running_center_distance, device)
     total_count = reduce_sum(float(sample_count), device)
+    total_positive_count = reduce_sum(float(positive_count), device)
+    total_tp = reduce_sum(float(tp_det), device)
+    total_fp = reduce_sum(float(fp_det), device)
+    total_fn = reduce_sum(float(fn_det), device)
+    total_tn = reduce_sum(float(tn_det), device)
+
     avg_loss = total_loss / max(total_count, 1.0)
-    avg_center_error = total_center_distance / max(total_count, 1.0)
-    return avg_loss, avg_center_error
+    avg_center_error = total_center_distance / max(total_positive_count, 1.0)
+    negative_false_positive_rate = safe_divide(total_fp, total_fp + total_tn)
+    positive_detection_rate = safe_divide(total_tp, total_tp + total_fn)
+
+    return {
+        "val_loss": avg_loss,
+        "center_l2_px_positive_only": avg_center_error,
+        "negative_false_positive_rate": negative_false_positive_rate,
+        "positive_detection_rate": positive_detection_rate,
+    }
 
 
 def save_checkpoint(
@@ -600,7 +822,7 @@ def save_checkpoint(
             "optimizer_state_dict": optimizer.state_dict(),
             "scheduler_state_dict": scheduler.state_dict(),
             "best_val_loss": best_val_loss,
-            "config": {**vars(args), "world_size": world_size},
+            "config": {**vars(args), "world_size": world_size, "backbone": getattr(args, "backbone", "efficientnet_b0")},
         },
         checkpoint_path,
     )
@@ -645,8 +867,7 @@ def append_metrics_row(
     metrics_path: Path,
     epoch: int,
     train_loss: float,
-    val_loss: float,
-    center_l2_px: float,
+    val_metrics: dict[str, float],
     lr: float,
     duration_sec: float,
 ) -> None:
@@ -657,14 +878,25 @@ def append_metrics_row(
         writer = csv.writer(handle)
         if is_new:
             writer.writerow(
-                ["epoch", "train_loss", "val_loss", "center_l2_px", "lr", "duration_sec"]
+                [
+                    "epoch",
+                    "train_loss",
+                    "val_loss",
+                    "center_l2_px_positive_only",
+                    "negative_false_positive_rate",
+                    "positive_detection_rate",
+                    "lr",
+                    "duration_sec",
+                ]
             )
         writer.writerow(
             [
                 epoch,
                 f"{train_loss:.6f}",
-                f"{val_loss:.6f}",
-                f"{center_l2_px:.4f}",
+                f"{val_metrics['val_loss']:.6f}",
+                f"{val_metrics['center_l2_px_positive_only']:.4f}",
+                f"{val_metrics['negative_false_positive_rate']:.6f}",
+                f"{val_metrics['positive_detection_rate']:.6f}",
                 f"{lr:.8f}",
                 f"{duration_sec:.2f}",
             ]
@@ -714,11 +946,30 @@ def cleanup_distributed() -> None:
         dist.destroy_process_group()
 
 
-def build_model(heatmap_size: tuple[int, int], device: torch.device, rank: int, world_size: int) -> nn.Module:
+def setup_logger(output_dir: Path) -> logging.Logger:
+    logger = logging.getLogger("train")
+    logger.setLevel(logging.INFO)
+    fmt = logging.Formatter("%(asctime)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+    sh = logging.StreamHandler(sys.stdout)
+    sh.setFormatter(fmt)
+    logger.addHandler(sh)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    fh = logging.FileHandler(output_dir / "training.log", encoding="utf-8")
+    fh.setFormatter(fmt)
+    logger.addHandler(fh)
+    return logger
+
+
+def build_model(heatmap_size: tuple[int, int], device: torch.device, rank: int, world_size: int, backbone: str = "efficientnet_b0") -> nn.Module:
     # Rank 0 loads pretrained weights first so other ranks can reuse the local cache.
     if world_size > 1 and rank != 0:
         dist.barrier()
-    model = CCTagNet(heatmap_size=heatmap_size).to(device)
+    if backbone == "mobilenet_v3_small":
+        model = CCTagNetMobileV3(heatmap_size=heatmap_size).to(device)
+    elif backbone == "resnet18":
+        model = CCTagNetResNet18(heatmap_size=heatmap_size).to(device)
+    else:
+        model = CCTagNet(heatmap_size=heatmap_size).to(device)
     if world_size > 1 and rank == 0:
         dist.barrier()
     if world_size > 1:
@@ -745,7 +996,7 @@ def main() -> None:
 
     preview_batch(train_loader)
 
-    model = build_model(heatmap_size=heatmap_size, device=device, rank=rank, world_size=world_size)
+    model = build_model(heatmap_size=heatmap_size, device=device, rank=rank, world_size=world_size, backbone=args.backbone)
     criterion = CombinedHeatmapLoss().to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -769,11 +1020,12 @@ def main() -> None:
         world_size=world_size,
     )
     metrics_path = args.output_dir / "metrics.csv"
+    logger = setup_logger(args.output_dir) if is_main_process() else logging.getLogger("train")
 
     best_val_loss = math.inf
     if is_main_process():
-        print(
-            f"training on {device} | world_size={world_size} | "
+        logger.info(
+            f"training on {device} | world_size={world_size} | backbone={args.backbone} | "
             f"samples={dataset_size} train={train_size} val={val_size} "
             f"input={args.input_width}x{args.input_height} heatmap={heatmap_size[1]}x{heatmap_size[0]} "
             f"per_gpu_batch={args.batch_size} global_batch={args.batch_size * world_size}"
@@ -785,7 +1037,7 @@ def main() -> None:
 
         start_time = time.time()
         train_loss = train_one_epoch(model, train_loader, optimizer, criterion, device)
-        val_loss, center_l2_px = validate(
+        val_metrics = validate(
             model,
             val_loader,
             criterion,
@@ -800,8 +1052,7 @@ def main() -> None:
             metrics_path=metrics_path,
             epoch=epoch,
             train_loss=train_loss,
-            val_loss=val_loss,
-            center_l2_px=center_l2_px,
+            val_metrics=val_metrics,
             lr=current_lr,
             duration_sec=duration_sec,
         )
@@ -828,8 +1079,8 @@ def main() -> None:
                 world_size=world_size,
             )
 
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
+        if val_metrics["val_loss"] < best_val_loss:
+            best_val_loss = val_metrics["val_loss"]
             save_checkpoint(
                 checkpoint_path=args.output_dir / "best.pt",
                 model=model,
@@ -842,11 +1093,13 @@ def main() -> None:
             )
 
         if is_main_process():
-            print(
+            logger.info(
                 f"epoch {epoch:03d}/{args.epochs:03d} "
                 f"train_loss={train_loss:.6f} "
-                f"val_loss={val_loss:.6f} "
-                f"center_l2_px={center_l2_px:.3f} "
+                f"val_loss={val_metrics['val_loss']:.6f} "
+                f"center_l2_px_positive_only={val_metrics['center_l2_px_positive_only']:.3f} "
+                f"negative_false_positive_rate={val_metrics['negative_false_positive_rate']:.4f} "
+                f"positive_detection_rate={val_metrics['positive_detection_rate']:.4f} "
                 f"lr={current_lr:.6g} "
                 f"time={duration_sec:.1f}s"
             )
@@ -859,6 +1112,6 @@ if __name__ == "__main__":
         main()
     except KeyboardInterrupt:
         if is_main_process():
-            print("training interrupted", file=sys.stderr)
+            logging.getLogger("train").warning("training interrupted")
         cleanup_distributed()
         raise SystemExit(130)

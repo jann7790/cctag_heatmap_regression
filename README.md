@@ -204,6 +204,23 @@ uv run torchrun --nproc_per_node=4 src/train_cctag_heatmap_ddp.py \
   --batch_size 18
 ```
 
+small backbone
+uv run torchrun --nproc_per_node=4 src/train_cctag_heatmap_ddp.py \
+    --backbone mobilenet_v3_small \
+    --dataset_dir ./outputs/training_sets/generated_training_sets/mixed_train_dataset \
+    --output_dir ./outputs/runs/experiment_mobilev3 \
+    --epochs 80 \
+    --batch_size 18
+    
+resnet:
+
+uv run torchrun --nproc_per_node=4 src/train_cctag_heatmap_ddp.py \
+    --dataset_dir ./outputs/training_sets/generated_training_sets/mixed_train_dataset \
+    --output_dir ./outputs/runs/experiment_resnet18_ddp \
+    --backbone resnet18 \
+    --epochs 80 \
+    --batch_size 18
+
 說明：
 
 - `--gpus 0,1,2` 用於 `src/train_cctag_heatmap.py` 的 DataParallel。

@@ -16,6 +16,7 @@ import csv
 import json
 import pickle
 import sys
+import time
 from pathlib import Path, PosixPath
 from typing import Any
 
@@ -56,6 +57,9 @@ def parse_args() -> argparse.Namespace:
         default=0.5,
         help="Threshold used to binarize predicted/GT heatmaps for precision, recall, F1, and IoU.",
     )
+    parser.add_argument("--compile", action="store_true", help="Use torch.compile() for faster inference (slow first run).")
+    parser.add_argument("--amp", action="store_true", help="Use AMP float16 for faster GPU inference.")
+    parser.add_argument("--batch_size", type=int, default=1, help="Batch size for inference (default: 1).")
     return parser.parse_args()
 
 
@@ -73,6 +77,22 @@ def ensure_torchvision():
     except ImportError as exc:
         raise SystemExit("pip install torchvision") from exc
     return efficientnet_b0, EfficientNet_B0_Weights
+
+
+def ensure_mobilenet_v3_small():
+    try:
+        from torchvision.models import MobileNet_V3_Small_Weights, mobilenet_v3_small
+    except ImportError as exc:
+        raise SystemExit("pip install torchvision") from exc
+    return mobilenet_v3_small, MobileNet_V3_Small_Weights
+
+
+def ensure_resnet18():
+    try:
+        from torchvision.models import ResNet18_Weights, resnet18
+    except ImportError as exc:
+        raise SystemExit("pip install torchvision") from exc
+    return resnet18, ResNet18_Weights
 
 
 class CCTagNet(nn.Module):
@@ -157,6 +177,61 @@ class CCTagNetV3(nn.Module):
         )
 
 
+class CCTagNetMobileV3(nn.Module):
+    """MobileNetV3-Small encoder with U-Net style skip connections."""
+
+    SKIP_INDICES = (0, 1, 3, 8)
+    BOTTLENECK_CHANNELS = 576
+
+    def __init__(self, heatmap_size: tuple[int, int]) -> None:
+        super().__init__()
+        mobilenet_v3_small, _ = ensure_mobilenet_v3_small()
+        backbone = mobilenet_v3_small(weights=None)
+        self.encoder = backbone.features
+        self.heatmap_height, self.heatmap_width = heatmap_size
+
+        self.dec1 = self._dec_block(self.BOTTLENECK_CHANNELS + 48, 128)
+        self.dec2 = self._dec_block(128 + 24, 64)
+        self.dec3 = self._dec_block(64 + 16, 32)
+        self.dec4 = self._dec_block(32 + 16, 16)
+        self.head = nn.Sequential(nn.Conv2d(16, 1, kernel_size=1), nn.Sigmoid())
+
+    @staticmethod
+    def _dec_block(in_ch: int, out_ch: int) -> nn.Sequential:
+        return nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+        )
+
+    def _encode(self, x: torch.Tensor) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        skips: list[torch.Tensor] = []
+        for i, layer in enumerate(self.encoder):
+            x = layer(x)
+            if i in self.SKIP_INDICES:
+                skips.append(x)
+        return x, skips  # x=576ch; skips=[16ch, 16ch, 24ch, 48ch]
+
+    @staticmethod
+    def _up_cat(x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
+        x = nn.functional.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False)
+        if x.shape[2:] != skip.shape[2:]:
+            skip = nn.functional.interpolate(skip, size=x.shape[2:], mode="bilinear", align_corners=False)
+        return torch.cat([x, skip], dim=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        bottleneck, (s16_s2, s16_s4, s24, s48) = self._encode(x)
+        x = self.dec1(self._up_cat(bottleneck, s48))
+        x = self.dec2(self._up_cat(x, s24))
+        x = self.dec3(self._up_cat(x, s16_s4))
+        x = self.dec4(self._up_cat(x, s16_s2))
+        x = self.head(x)
+        return nn.functional.interpolate(
+            x, size=(self.heatmap_height, self.heatmap_width),
+            mode="bilinear", align_corners=False,
+        )
+
+
 # ── helpers ───────────────────────────────────────────────────────────────────
 
 def load_model(checkpoint_path: Path, device: torch.device) -> tuple[nn.Module, dict]:
@@ -169,7 +244,12 @@ def load_model(checkpoint_path: Path, device: torch.device) -> tuple[nn.Module, 
         ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     config = ckpt.get("config", {})
     heatmap_size = (config.get("heatmap_height", 100), config.get("heatmap_width", 160))
-    if "dec1.0.weight" in ckpt["model_state_dict"]:
+    backbone = config.get("backbone", "efficientnet_b0")
+    if backbone == "mobilenet_v3_small":
+        model = CCTagNetMobileV3(heatmap_size=heatmap_size).to(device)
+    elif backbone == "resnet18":
+        model = CCTagNetResNet18(heatmap_size=heatmap_size).to(device)
+    elif "dec1.0.weight" in ckpt["model_state_dict"]:
         model = CCTagNetV3(heatmap_size=heatmap_size).to(device)
     else:
         model = CCTagNet(heatmap_size=heatmap_size).to(device)
@@ -242,6 +322,72 @@ def decode_center_subpixel(heatmap: np.ndarray, threshold: float = 0.3) -> tuple
         delta_y = float(np.clip(delta_y, -0.5, 0.5))
 
     return float(px) + delta_x, float(py) + delta_y
+
+
+class CCTagNetResNet18(nn.Module):
+    """ResNet-18 encoder with U-Net style skip connections.
+
+    Skip taps:
+        relu(conv1) → 64ch, stride 2
+        layer1      → 64ch, stride 4
+        layer2      → 128ch, stride 8
+        layer3      → 256ch, stride 16
+    Bottleneck (layer4) → 512ch, stride 32
+    """
+
+    def __init__(self, heatmap_size: tuple[int, int]) -> None:
+        super().__init__()
+        resnet18, ResNet18_Weights = ensure_resnet18()
+        backbone = resnet18(weights=None)
+        self.stem = nn.Sequential(backbone.conv1, backbone.bn1, backbone.relu)
+        self.maxpool = backbone.maxpool
+        self.layer1 = backbone.layer1
+        self.layer2 = backbone.layer2
+        self.layer3 = backbone.layer3
+        self.layer4 = backbone.layer4
+        self.heatmap_height, self.heatmap_width = heatmap_size
+
+        self.dec1 = self._dec_block(512 + 256, 256)
+        self.dec2 = self._dec_block(256 + 128, 128)
+        self.dec3 = self._dec_block(128 + 64, 64)
+        self.dec4 = self._dec_block(64 + 64, 32)
+        self.head = nn.Sequential(nn.Conv2d(32, 1, kernel_size=1), nn.Sigmoid())
+
+    @staticmethod
+    def _dec_block(in_ch: int, out_ch: int) -> nn.Sequential:
+        return nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+        )
+
+    @staticmethod
+    def _up_cat(x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
+        x = nn.functional.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False)
+        if x.shape[2:] != skip.shape[2:]:
+            skip = nn.functional.interpolate(skip, size=x.shape[2:], mode="bilinear", align_corners=False)
+        return torch.cat([x, skip], dim=1)
+
+    def _encode(self, x: torch.Tensor) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
+        s64_s2 = self.stem(x)
+        x = self.maxpool(s64_s2)
+        s64_s4 = self.layer1(x)
+        s128_s8 = self.layer2(s64_s4)
+        s256_s16 = self.layer3(s128_s8)
+        bottleneck = self.layer4(s256_s16)
+        return bottleneck, (s64_s2, s64_s4, s128_s8, s256_s16)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        bottleneck, (s64_s2, s64_s4, s128_s8, s256_s16) = self._encode(x)
+        x = self.dec1(self._up_cat(bottleneck, s256_s16))
+        x = self.dec2(self._up_cat(x, s128_s8))
+        x = self.dec3(self._up_cat(x, s64_s4))
+        x = self.dec4(self._up_cat(x, s64_s2))
+        x = self.head(x)
+        return nn.functional.interpolate(
+            x, size=(self.heatmap_height, self.heatmap_width),
+            mode="bilinear", align_corners=False,
+        )
 
 
 class HeatmapDiceLoss(nn.Module):
@@ -420,9 +566,14 @@ def main() -> None:
     print(f"loading checkpoint: {args.checkpoint}")
     model, config = load_model(args.checkpoint, device)
 
+    if args.compile:
+        print("compiling model with torch.compile (first run will be slow)...")
+        model = torch.compile(model)
+
     input_width  = config.get("input_width",  640)
     input_height = config.get("input_height", 400)
-    print(f"model input: {input_width}x{input_height}  device: {device}")
+    backbone = config.get("backbone", "efficientnet_b0")
+    print(f"model input: {input_width}x{input_height}  backbone: {backbone}  device: {device}")
 
     # collect image paths
     if args.input.is_dir():
@@ -458,98 +609,133 @@ def main() -> None:
         dice_criterion = None
         eval_rows = []
 
-    with torch.no_grad():
-        for img_path in image_paths:
-            tensor, (orig_w, orig_h) = preprocess(img_path, input_width, input_height, device)
-            heatmap_tensor = model(tensor)                        # (1, 1, H, W)
-            heatmap = heatmap_tensor[0, 0].cpu().numpy()         # (H, W)
+    use_amp = args.amp and device.type == "cuda"
 
-            peak_val = float(heatmap.max())
-            result = decode_center_subpixel(heatmap, threshold=args.threshold)
+    def _process_single(img_path: Path, heatmap: np.ndarray, heatmap_tensor: torch.Tensor) -> None:
+        """Post-process a single image: print result, save outputs, evaluate."""
+        peak_val = float(heatmap.max())
+        result = decode_center_subpixel(heatmap, threshold=args.threshold)
 
-            if result is None:
-                print(f"{img_path.name}  NO DETECTION  peak={peak_val:.3f} (< {args.threshold})")
+        cx_px, cy_px = 0.0, 0.0
+        if result is None:
+            print(f"{img_path.name}  NO DETECTION  peak={peak_val:.3f} (< {args.threshold})")
+        else:
+            cx_hm, cy_hm = result
+            hm_h, hm_w = heatmap.shape
+            tensor_for_orig, (orig_w, orig_h) = _orig_sizes[img_path]
+            cx_px = cx_hm * orig_w / hm_w
+            cy_px = cy_hm * orig_h / hm_h
+            print(f"{img_path.name}  center=({cx_px:.1f}, {cy_px:.1f})px  heatmap_peak=({cx_hm:.1f}, {cy_hm:.1f})  peak={peak_val:.3f}")
+
+        if args.output:
+            stem = img_path.stem
+            np.save(args.output / f"{stem}_heatmap.npy", heatmap)
+            if args.vis and result is not None:
+                save_overlay(img_path, heatmap, result, args.output / f"{stem}_overlay.png")
+
+        if gt_map is not None:
+            stem = img_path.stem
+            gt_row = gt_map.get(stem)
+            if gt_row is None:
+                print(f"{img_path.name}  warning: missing GT row in labels.csv, skipped evaluation")
+                return
+
+            gt_heatmap_path = gt_row["heatmap_path"]
+            if not gt_heatmap_path.is_file():
+                print(f"{img_path.name}  warning: missing GT heatmap {gt_heatmap_path}, skipped evaluation")
+                return
+
+            gt_heatmap_raw = np.load(gt_heatmap_path).astype(np.float32)
+            gt_heatmap = resize_heatmap_to_shape(gt_heatmap_raw, heatmap.shape)
+            gt_tensor = torch.from_numpy(gt_heatmap[None, None, ...]).to(device)
+
+            combined_loss = float(combined_criterion(heatmap_tensor, gt_tensor).cpu().item())
+            bce_loss = float(bce_criterion(heatmap_tensor, gt_tensor).cpu().item())
+            dice_loss = float(dice_criterion(heatmap_tensor, gt_tensor).cpu().item())
+
+            pred_bin = heatmap >= args.heatmap_binary_threshold
+            gt_bin = gt_heatmap >= args.heatmap_binary_threshold
+            tp_pixels = int(np.logical_and(pred_bin, gt_bin).sum())
+            fp_pixels = int(np.logical_and(pred_bin, np.logical_not(gt_bin)).sum())
+            fn_pixels = int(np.logical_and(np.logical_not(pred_bin), gt_bin).sum())
+            tn_pixels = int(np.logical_and(np.logical_not(pred_bin), np.logical_not(gt_bin)).sum())
+
+            is_negative_gt = bool(gt_row["is_negative"])
+            gt_has_object = not is_negative_gt
+            pred_has_object = result is not None
+
+            tp_det = int(gt_has_object and pred_has_object)
+            fp_det = int((not gt_has_object) and pred_has_object)
+            fn_det = int(gt_has_object and (not pred_has_object))
+            tn_det = int((not gt_has_object) and (not pred_has_object))
+
+            center_l2_px: float | None = None
+            if gt_has_object and pred_has_object:
+                gt_cx = float(gt_row["center_x"])
+                gt_cy = float(gt_row["center_y"])
+                center_l2_px = float(np.hypot(cx_px - gt_cx, cy_px - gt_cy))
+
+            eval_rows.append(
+                {
+                    "filename": stem,
+                    "peak": peak_val,
+                    "pred_detected": int(pred_has_object),
+                    "gt_detected": int(gt_has_object),
+                    "combined_loss": combined_loss,
+                    "bce_loss": bce_loss,
+                    "dice_loss": dice_loss,
+                    "center_l2_px": center_l2_px,
+                    "tp_pixels": tp_pixels,
+                    "fp_pixels": fp_pixels,
+                    "fn_pixels": fn_pixels,
+                    "tn_pixels": tn_pixels,
+                    "tp_det": tp_det,
+                    "fp_det": fp_det,
+                    "fn_det": fn_det,
+                    "tn_det": tn_det,
+                    "is_negative_gt": int(is_negative_gt),
+                    "has_visible_marker": int(gt_row["has_visible_marker"]),
+                    "gt_heatmap_height_raw": int(gt_heatmap_raw.shape[0]),
+                    "gt_heatmap_width_raw": int(gt_heatmap_raw.shape[1]),
+                    "eval_heatmap_height": int(gt_heatmap.shape[0]),
+                    "eval_heatmap_width": int(gt_heatmap.shape[1]),
+                }
+            )
+
+    # Cache original sizes for batch processing
+    _orig_sizes: dict[Path, tuple[None, tuple[int, int]]] = {}
+
+    t_start = time.perf_counter()
+    with torch.inference_mode():
+        # Process in batches
+        for batch_start in range(0, len(image_paths), args.batch_size):
+            batch_paths = image_paths[batch_start : batch_start + args.batch_size]
+            batch_tensors = []
+            for img_path in batch_paths:
+                tensor, orig_size = preprocess(img_path, input_width, input_height, device)
+                batch_tensors.append(tensor)
+                _orig_sizes[img_path] = (None, orig_size)
+
+            batch_input = torch.cat(batch_tensors, dim=0)  # (B, 3, H, W)
+
+            if use_amp:
+                with torch.autocast("cuda", dtype=torch.float16):
+                    batch_heatmaps = model(batch_input)  # (B, 1, Hh, Hw)
             else:
-                cx_hm, cy_hm = result
-                hm_h, hm_w = heatmap.shape
-                cx_px = cx_hm * orig_w / hm_w
-                cy_px = cy_hm * orig_h / hm_h
-                print(f"{img_path.name}  center=({cx_px:.1f}, {cy_px:.1f})px  heatmap_peak=({cx_hm:.1f}, {cy_hm:.1f})  peak={peak_val:.3f}")
+                batch_heatmaps = model(batch_input)
 
-            if args.output:
-                stem = img_path.stem
-                np.save(args.output / f"{stem}_heatmap.npy", heatmap)
-                if args.vis and result is not None:
-                    save_overlay(img_path, heatmap, result, args.output / f"{stem}_overlay.png")
+            for i, img_path in enumerate(batch_paths):
+                heatmap_tensor = batch_heatmaps[i : i + 1]  # (1, 1, H, W)
+                heatmap = heatmap_tensor[0, 0].float().cpu().numpy()
+                _process_single(img_path, heatmap, heatmap_tensor.float())
 
-            if gt_map is not None:
-                stem = img_path.stem
-                gt_row = gt_map.get(stem)
-                if gt_row is None:
-                    print(f"{img_path.name}  warning: missing GT row in labels.csv, skipped evaluation")
-                    continue
-
-                gt_heatmap_path = gt_row["heatmap_path"]
-                if not gt_heatmap_path.is_file():
-                    print(f"{img_path.name}  warning: missing GT heatmap {gt_heatmap_path}, skipped evaluation")
-                    continue
-
-                gt_heatmap_raw = np.load(gt_heatmap_path).astype(np.float32)
-                gt_heatmap = resize_heatmap_to_shape(gt_heatmap_raw, heatmap.shape)
-                gt_tensor = torch.from_numpy(gt_heatmap[None, None, ...]).to(device)
-
-                combined_loss = float(combined_criterion(heatmap_tensor, gt_tensor).cpu().item())
-                bce_loss = float(bce_criterion(heatmap_tensor, gt_tensor).cpu().item())
-                dice_loss = float(dice_criterion(heatmap_tensor, gt_tensor).cpu().item())
-
-                pred_bin = heatmap >= args.heatmap_binary_threshold
-                gt_bin = gt_heatmap >= args.heatmap_binary_threshold
-                tp_pixels = int(np.logical_and(pred_bin, gt_bin).sum())
-                fp_pixels = int(np.logical_and(pred_bin, np.logical_not(gt_bin)).sum())
-                fn_pixels = int(np.logical_and(np.logical_not(pred_bin), gt_bin).sum())
-                tn_pixels = int(np.logical_and(np.logical_not(pred_bin), np.logical_not(gt_bin)).sum())
-
-                is_negative_gt = bool(gt_row["is_negative"])
-                gt_has_object = not is_negative_gt
-                pred_has_object = result is not None
-
-                tp_det = int(gt_has_object and pred_has_object)
-                fp_det = int((not gt_has_object) and pred_has_object)
-                fn_det = int(gt_has_object and (not pred_has_object))
-                tn_det = int((not gt_has_object) and (not pred_has_object))
-
-                center_l2_px: float | None = None
-                if gt_has_object and pred_has_object:
-                    gt_cx = float(gt_row["center_x"])
-                    gt_cy = float(gt_row["center_y"])
-                    center_l2_px = float(np.hypot(cx_px - gt_cx, cy_px - gt_cy))
-
-                eval_rows.append(
-                    {
-                        "filename": stem,
-                        "peak": peak_val,
-                        "pred_detected": int(pred_has_object),
-                        "gt_detected": int(gt_has_object),
-                        "combined_loss": combined_loss,
-                        "bce_loss": bce_loss,
-                        "dice_loss": dice_loss,
-                        "center_l2_px": center_l2_px,
-                        "tp_pixels": tp_pixels,
-                        "fp_pixels": fp_pixels,
-                        "fn_pixels": fn_pixels,
-                        "tn_pixels": tn_pixels,
-                        "tp_det": tp_det,
-                        "fp_det": fp_det,
-                        "fn_det": fn_det,
-                        "tn_det": tn_det,
-                        "is_negative_gt": int(is_negative_gt),
-                        "has_visible_marker": int(gt_row["has_visible_marker"]),
-                        "gt_heatmap_height_raw": int(gt_heatmap_raw.shape[0]),
-                        "gt_heatmap_width_raw": int(gt_heatmap_raw.shape[1]),
-                        "eval_heatmap_height": int(gt_heatmap.shape[0]),
-                        "eval_heatmap_width": int(gt_heatmap.shape[1]),
-                    }
-                )
+    t_elapsed = time.perf_counter() - t_start
+    n_images = len(image_paths)
+    print(f"\ninference: {n_images} images in {t_elapsed:.2f}s ({t_elapsed/n_images*1000:.1f}ms/image, {n_images/t_elapsed:.1f} FPS)")
+    if use_amp:
+        print("  (AMP float16 enabled)")
+    if args.compile:
+        print("  (torch.compile enabled — first-run overhead included)")
 
     if gt_map is not None:
         summarize_evaluation(eval_rows, args.output)
