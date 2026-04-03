@@ -11,13 +11,15 @@ fi
 GENERATOR="${GENERATOR:-./src/generate_cctag_dataset.py}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-./outputs/training_sets/generated_training_sets}"
 
-BASE_COUNT="${BASE_COUNT:-3000}"
-HARD_COUNT="${HARD_COUNT:-2000}"
-EXTREME_COUNT="${EXTREME_COUNT:-1000}"
-SMALL_COUNT="${SMALL_COUNT:-1000}"
+BASE_COUNT="${BASE_COUNT:-4000}"
+HARD_COUNT="${HARD_COUNT:-3000}"
+EXTREME_COUNT="${EXTREME_COUNT:-1500}"
+SMALL_COUNT="${SMALL_COUNT:-1500}"
+HARD_NEG_COUNT="${HARD_NEG_COUNT:-3000}"
+OVEREXPOSURE_COUNT="${OVEREXPOSURE_COUNT:-2000}"
 
-BASE_CLEAN_COUNT="${BASE_CLEAN_COUNT:-900}"
-BASE_LOW_OCC_COUNT="${BASE_LOW_OCC_COUNT:-2100}"
+BASE_CLEAN_COUNT="${BASE_CLEAN_COUNT:-1200}"
+BASE_LOW_OCC_COUNT="${BASE_LOW_OCC_COUNT:-2800}"
 
 if [[ $((BASE_CLEAN_COUNT + BASE_LOW_OCC_COUNT)) -ne ${BASE_COUNT} ]]; then
   echo "Base split mismatch: BASE_CLEAN_COUNT + BASE_LOW_OCC_COUNT must equal BASE_COUNT" >&2
@@ -95,11 +97,15 @@ BASE_DIR="${OUTPUT_ROOT}/base_set"
 HARD_DIR="${OUTPUT_ROOT}/hard_set"
 EXTREME_DIR="${OUTPUT_ROOT}/extreme_set"
 SMALL_DIR="${OUTPUT_ROOT}/small_set"
+HARD_NEG_DIR="${OUTPUT_ROOT}/hard_negative_set"
+OVEREXPOSURE_DIR="${OUTPUT_ROOT}/overexposure_set"
 
 ensure_absent "${BASE_DIR}"
 ensure_absent "${HARD_DIR}"
 ensure_absent "${EXTREME_DIR}"
 ensure_absent "${SMALL_DIR}"
+ensure_absent "${HARD_NEG_DIR}"
+ensure_absent "${OVEREXPOSURE_DIR}"
 
 TMP_ROOT="$(mktemp -d "${OUTPUT_ROOT}/.tmp_training_sets.XXXXXX")"
 trap 'rm -rf "${TMP_ROOT}"' EXIT
@@ -165,8 +171,59 @@ generate_one "small_set" \
   --soft_focus_strength 0.50 \
   "${common_args[@]}"
 
+# ---------- NEW: Hard negative set ----------
+# No marker present, complex backgrounds with curves/arcs/rings that
+# resemble CCTag patterns. High negative ratio forces the model to learn
+# what is NOT a CCTag.
+generate_one "hard_negative_set" \
+  --num_images "${HARD_NEG_COUNT}" \
+  --output_dir "${HARD_NEG_DIR}" \
+  --seed 47 \
+  --marker_min 66 \
+  --marker_max 333 \
+  --occ_min 0.0 \
+  --occ_max 0.0 \
+  --soft_focus_strength 0.30 \
+  --background_complexity complex \
+  --negative_ratio 0.70 \
+  --output_size 640x400 \
+  --marker_style cctag_source \
+  --num_rings 3 \
+  --heatmap_stride 8 \
+  --heatmap_sigma 2.0 \
+  --partial_out_prob 0.10 \
+  --partial_out_max_ratio 0.25 \
+  --occlusion_style aggressive
+
+# ---------- NEW: Overexposure set ----------
+# Simulates blown-out, bright scenes that cause false positives in
+# real-world tracking. Mix of positive and negative samples under
+# strong overexposure.
+generate_one "overexposure_set" \
+  --num_images "${OVEREXPOSURE_COUNT}" \
+  --output_dir "${OVEREXPOSURE_DIR}" \
+  --seed 48 \
+  --marker_min 66 \
+  --marker_max 333 \
+  --occ_min 0.0 \
+  --occ_max 0.50 \
+  --soft_focus_strength 0.40 \
+  --overexposure_prob 0.80 \
+  --background_complexity complex \
+  --negative_ratio 0.50 \
+  --output_size 640x400 \
+  --marker_style cctag_source \
+  --num_rings 3 \
+  --heatmap_stride 8 \
+  --heatmap_sigma 2.0 \
+  --partial_out_prob 0.15 \
+  --partial_out_max_ratio 0.25 \
+  --occlusion_style aggressive
+
 echo "==> training sets ready under ${OUTPUT_ROOT}"
 echo "   - ${BASE_DIR}"
 echo "   - ${HARD_DIR}"
 echo "   - ${EXTREME_DIR}"
 echo "   - ${SMALL_DIR}"
+echo "   - ${HARD_NEG_DIR}"
+echo "   - ${OVEREXPOSURE_DIR}"

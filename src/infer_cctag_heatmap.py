@@ -60,6 +60,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--compile", action="store_true", help="Use torch.compile() for faster inference (slow first run).")
     parser.add_argument("--amp", action="store_true", help="Use AMP float16 for faster GPU inference.")
     parser.add_argument("--batch_size", type=int, default=1, help="Batch size for inference (default: 1).")
+    parser.add_argument("--min_peak_sharpness", type=float, default=0.0,
+                        help="Minimum peak sharpness ratio (peak / mean of top region) to accept a detection. "
+                             "Real CCTags produce sharp peaks (ratio > 3); false positives from overexposure "
+                             "produce diffuse activations (ratio < 2). Set to 0 to disable. Recommended: 3.0.")
+    parser.add_argument("--tracking_mode", action="store_true",
+                        help="Enable conservative tracking defaults: threshold=0.65, min_peak_sharpness=3.0.")
+    parser.add_argument("--temporal_window", type=int, default=0,
+                        help="Require detection in at least ceil(N*0.6) of the last N frames to accept. "
+                             "Filters out sporadic single-frame false positives. 0 disables. Recommended: 5.")
     return parser.parse_args()
 
 
@@ -324,6 +333,44 @@ def decode_center_subpixel(heatmap: np.ndarray, threshold: float = 0.3) -> tuple
     return float(px) + delta_x, float(py) + delta_y
 
 
+def compute_peak_sharpness(heatmap: np.ndarray, radius: int = 5) -> float:
+    """Compute peak sharpness as peak_value / mean_of_surrounding_region.
+
+    A sharp Gaussian peak (real CCTag) has a high ratio (> 3).
+    A diffuse broad activation (false positive from overexposure) has a low ratio (< 2).
+    """
+    peak_val = float(heatmap.max())
+    if peak_val < 1e-6:
+        return 0.0
+    h, w = heatmap.shape
+    flat_idx = int(np.argmax(heatmap))
+    py, px = divmod(flat_idx, w)
+    y_lo = max(0, py - radius)
+    y_hi = min(h, py + radius + 1)
+    x_lo = max(0, px - radius)
+    x_hi = min(w, px + radius + 1)
+    region = heatmap[y_lo:y_hi, x_lo:x_hi]
+    region_mean = float(region.mean())
+    if region_mean < 1e-6:
+        return 0.0
+    return peak_val / region_mean
+
+
+class _TemporalFilter:
+    """Ring buffer that requires M-of-N recent frames to have detections."""
+
+    def __init__(self, window: int) -> None:
+        self.window = window
+        self.min_hits = int(np.ceil(window * 0.6))
+        self.buffer: list[bool] = []
+
+    def update(self, detected: bool) -> bool:
+        self.buffer.append(detected)
+        if len(self.buffer) > self.window:
+            self.buffer.pop(0)
+        return sum(self.buffer) >= self.min_hits
+
+
 class CCTagNetResNet18(nn.Module):
     """ResNet-18 encoder with U-Net style skip connections.
 
@@ -561,6 +608,20 @@ def save_overlay(image_path: Path, heatmap: np.ndarray, center_xy: tuple[float, 
 
 def main() -> None:
     args = parse_args()
+
+    # Apply conservative tracking defaults when --tracking_mode is set
+    if args.tracking_mode:
+        if args.threshold == 0.5:  # only override if user didn't set explicitly
+            args.threshold = 0.65
+        if args.min_peak_sharpness == 0.0:
+            args.min_peak_sharpness = 3.0
+        if args.temporal_window == 0:
+            args.temporal_window = 5
+
+    temporal_filter: _TemporalFilter | None = None
+    if args.temporal_window > 0:
+        temporal_filter = _TemporalFilter(args.temporal_window)
+
     device = resolve_device(args.device)
 
     print(f"loading checkpoint: {args.checkpoint}")
@@ -616,6 +677,21 @@ def main() -> None:
         peak_val = float(heatmap.max())
         result = decode_center_subpixel(heatmap, threshold=args.threshold)
 
+        # Peak sharpness filter: reject diffuse broad activations
+        sharpness = 0.0
+        if result is not None and args.min_peak_sharpness > 0:
+            sharpness = compute_peak_sharpness(heatmap)
+            if sharpness < args.min_peak_sharpness:
+                print(f"{img_path.name}  REJECTED (sharpness={sharpness:.2f} < {args.min_peak_sharpness})  peak={peak_val:.3f}")
+                result = None
+
+        # Temporal consistency filter: require M-of-N recent detections
+        if temporal_filter is not None:
+            accepted = temporal_filter.update(result is not None)
+            if result is not None and not accepted:
+                print(f"{img_path.name}  REJECTED (temporal filter: insufficient consecutive detections)  peak={peak_val:.3f}")
+                result = None
+
         cx_px, cy_px = 0.0, 0.0
         if result is None:
             print(f"{img_path.name}  NO DETECTION  peak={peak_val:.3f} (< {args.threshold})")
@@ -625,7 +701,8 @@ def main() -> None:
             tensor_for_orig, (orig_w, orig_h) = _orig_sizes[img_path]
             cx_px = cx_hm * orig_w / hm_w
             cy_px = cy_hm * orig_h / hm_h
-            print(f"{img_path.name}  center=({cx_px:.1f}, {cy_px:.1f})px  heatmap_peak=({cx_hm:.1f}, {cy_hm:.1f})  peak={peak_val:.3f}")
+            sharpness_str = f"  sharpness={sharpness:.2f}" if args.min_peak_sharpness > 0 else ""
+            print(f"{img_path.name}  center=({cx_px:.1f}, {cy_px:.1f})px  heatmap_peak=({cx_hm:.1f}, {cy_hm:.1f})  peak={peak_val:.3f}{sharpness_str}")
 
         if args.output:
             stem = img_path.stem

@@ -126,6 +126,8 @@ def validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> 
         )
     if not 0.0 <= args.soft_focus_strength <= 1.0:
         parser.error("--soft_focus_strength must be between 0.0 and 1.0.")
+    if not 0.0 <= args.overexposure_prob <= 1.0:
+        parser.error("--overexposure_prob must be between 0.0 and 1.0.")
 
 
 @lru_cache(maxsize=None)
@@ -556,13 +558,64 @@ def apply_random_occlusion(
 # Background Compositing
 # ============================================================================
 
+def _draw_complex_background_elements(bg: np.ndarray) -> np.ndarray:
+    """Draw random curves, arcs, and circles onto a background to create
+    confusing patterns that the model must learn to ignore."""
+    bh, bw = bg.shape[:2]
+    n_elements = random.randint(3, 12)
+    for _ in range(n_elements):
+        elem_type = random.random()
+        color = random.randint(0, 255)
+        thickness = random.randint(1, 4)
+        if elem_type < 0.3:
+            # Random circle / arc
+            cx = random.randint(0, bw - 1)
+            cy = random.randint(0, bh - 1)
+            radius = random.randint(10, max(11, min(bh, bw) // 3))
+            if random.random() < 0.5:
+                cv2.circle(bg, (cx, cy), radius, int(color), thickness)
+            else:
+                angle_start = random.randint(0, 360)
+                angle_end = angle_start + random.randint(30, 300)
+                cv2.ellipse(bg, (cx, cy), (radius, random.randint(radius // 2, radius)),
+                            random.randint(0, 180), angle_start, angle_end,
+                            int(color), thickness)
+        elif elem_type < 0.6:
+            # Random Bezier-like polyline (smooth curve)
+            n_pts = random.randint(3, 6)
+            pts = np.array([(random.randint(0, bw - 1), random.randint(0, bh - 1))
+                            for _ in range(n_pts)], dtype=np.int32)
+            cv2.polylines(bg, [pts], isClosed=False, color=int(color), thickness=thickness)
+        elif elem_type < 0.8:
+            # Concentric rings (CCTag-like confuser)
+            cx = random.randint(bw // 4, 3 * bw // 4)
+            cy = random.randint(bh // 4, 3 * bh // 4)
+            n_rings = random.randint(2, 5)
+            base_r = random.randint(8, max(9, min(bh, bw) // 6))
+            for j in range(n_rings):
+                r = base_r + j * random.randint(3, 8)
+                ring_color = random.choice([random.randint(0, 80), random.randint(180, 255)])
+                cv2.circle(bg, (cx, cy), r, int(ring_color), thickness)
+        else:
+            # Random line
+            x1, y1 = random.randint(0, bw - 1), random.randint(0, bh - 1)
+            x2, y2 = random.randint(0, bw - 1), random.randint(0, bh - 1)
+            cv2.line(bg, (x1, y1), (x2, y2), int(color), thickness)
+    return bg
+
+
 def composite_on_background(
     marker_img: np.ndarray,
     bg_size: tuple[int, int] = (256, 256),
+    background_complexity: str = "standard",
 ) -> tuple[np.ndarray, tuple[float, float], float]:
     """
     Place the marker image onto a random synthetic background.
     The marker canvas is assumed to have gray (128) as transparent.
+
+    Args:
+        background_complexity: "standard" for normal backgrounds,
+            "complex" to add random curves/arcs/circles that act as hard negatives.
 
     Returns the composited image, offset applied, and scale used.
     """
@@ -579,14 +632,17 @@ def composite_on_background(
         end_val = random.randint(100, 220)
         if random.random() < 0.5:
             gradient = np.linspace(start_val, end_val, bh, dtype=np.float32)[:, None]
-            bg = np.broadcast_to(gradient, (bh, bw)).astype(np.uint8)
+            bg = np.broadcast_to(gradient, (bh, bw)).astype(np.uint8).copy()
         else:
             gradient = np.linspace(start_val, end_val, bw, dtype=np.float32)[None, :]
-            bg = np.broadcast_to(gradient, (bh, bw)).astype(np.uint8)
+            bg = np.broadcast_to(gradient, (bh, bw)).astype(np.uint8).copy()
     else:
         # Noise texture
         bg = np.random.randint(60, 200, (bh, bw), dtype=np.uint8)
         bg = cv2.GaussianBlur(bg, (15, 15), 5)
+
+    if background_complexity == "complex":
+        bg = _draw_complex_background_elements(bg)
 
     # Composite: overwrite where marker is not gray background
     mh, mw = marker_img.shape[:2]
@@ -616,9 +672,14 @@ def apply_degradation(
     scintillation_prob: float = 0.15,
     degradation_preset: str = "standard",
     soft_focus_strength: float = 0.0,
+    overexposure_prob: float = 0.0,
 ) -> np.ndarray:
     """
     Apply realistic image degradation simulating long-distance FSO observation.
+
+    Args:
+        overexposure_prob: Probability of applying overexposure simulation
+            (gamma compression + brightness boost) to mimic blown-out scenes.
     """
     img = img.astype(np.float32, copy=False)
 
@@ -630,6 +691,13 @@ def apply_degradation(
         contrast_range = (0.78, 0.92)
         motion_blur_prob = 0.05
         scintillation_prob = 0.05
+
+    # Overexposure simulation: gamma compression + strong brightness lift
+    if overexposure_prob > 0.0 and random.random() < overexposure_prob:
+        gamma = random.uniform(0.3, 0.6)  # low gamma = brighter
+        img = 255.0 * np.power(np.clip(img / 255.0, 0, 1), gamma)
+        lift = random.uniform(40, 120)
+        img = img + lift
 
     # Brightness / contrast
     alpha = random.uniform(*contrast_range)
@@ -986,6 +1054,8 @@ def generate_empty_negative_sample(
     heatmap_stride: int,
     degradation_preset: str,
     soft_focus_strength: float,
+    background_complexity: str = "standard",
+    overexposure_prob: float = 0.0,
 ) -> tuple[np.ndarray, np.ndarray, dict]:
     output_w, output_h = output_size
     heatmap_w = output_w // heatmap_stride
@@ -994,11 +1064,13 @@ def generate_empty_negative_sample(
     render_h = output_h * 2
 
     blank_marker = np.full((render_h, render_w), 128, dtype=np.uint8)
-    bg, _, _ = composite_on_background(blank_marker, bg_size=(render_h, render_w))
+    bg, _, _ = composite_on_background(blank_marker, bg_size=(render_h, render_w),
+                                       background_complexity=background_complexity)
     bg = apply_degradation(
         bg,
         degradation_preset=degradation_preset,
         soft_focus_strength=soft_focus_strength,
+        overexposure_prob=overexposure_prob,
     )
     final_img = cv2.resize(bg, (output_w, output_h), interpolation=cv2.INTER_AREA)
     heatmap = generate_negative_heatmap((heatmap_h, heatmap_w))
@@ -1021,6 +1093,8 @@ def generate_marker_sample(
     placement_mode: str = "auto",
     degradation_preset: str = "standard",
     soft_focus_strength: float = 0.0,
+    background_complexity: str = "standard",
+    overexposure_prob: float = 0.0,
 ) -> tuple[np.ndarray, np.ndarray, dict]:
     output_w, output_h = output_size
     heatmap_w = output_w // heatmap_stride
@@ -1063,11 +1137,13 @@ def generate_marker_sample(
         occlusion_style=occlusion_style,
     )
 
-    bg, _, _ = composite_on_background(img, bg_size=(render_h, render_w))
+    bg, _, _ = composite_on_background(img, bg_size=(render_h, render_w),
+                                       background_complexity=background_complexity)
     bg = apply_degradation(
         bg,
         degradation_preset=degradation_preset,
         soft_focus_strength=soft_focus_strength,
+        overexposure_prob=overexposure_prob,
     )
     final_img = cv2.resize(bg, (output_w, output_h), interpolation=cv2.INTER_AREA)
 
@@ -1177,6 +1253,8 @@ def generate_single_sample(
     force_normal_positive: bool = False,
     degradation_preset: str = "standard",
     soft_focus_strength: float = 0.0,
+    background_complexity: str = "standard",
+    overexposure_prob: float = 0.0,
 ) -> tuple[np.ndarray, np.ndarray, dict]:
     """
     Generate one training sample: image + heatmap + metadata.
@@ -1196,6 +1274,8 @@ def generate_single_sample(
             heatmap_stride=heatmap_stride,
             degradation_preset=degradation_preset,
             soft_focus_strength=soft_focus_strength,
+            background_complexity=background_complexity,
+            overexposure_prob=overexposure_prob,
         )
 
     desired_target_clamped = None
@@ -1228,6 +1308,8 @@ def generate_single_sample(
             placement_mode=placement_mode,
             degradation_preset=degradation_preset,
             soft_focus_strength=soft_focus_strength,
+            background_complexity=background_complexity,
+            overexposure_prob=overexposure_prob,
         )
         _, _, meta = last_sample
         if desired_target_clamped is None or meta["target_clamped"] == desired_target_clamped:
@@ -1325,6 +1407,8 @@ def generate_dataset(args):
         "yolo_class_id": args.yolo_class_id,
         "degradation_preset": args.degradation_preset,
         "soft_focus_strength": args.soft_focus_strength,
+        "background_complexity": args.background_complexity,
+        "overexposure_prob": args.overexposure_prob,
         "seed": args.seed,
     }
 
@@ -1381,6 +1465,8 @@ def generate_dataset(args):
             force_normal_positive=(sample_mode == "normal_positive"),
             degradation_preset=args.degradation_preset,
             soft_focus_strength=args.soft_focus_strength,
+            background_complexity=args.background_complexity,
+            overexposure_prob=args.overexposure_prob,
         )
 
         fname = f"{i:06d}"
@@ -1509,6 +1595,13 @@ def main():
                         help="Image degradation style. 'soft_focus' produces lower-contrast blurred markers similar to defocused captures.")
     parser.add_argument("--soft_focus_strength", type=float, default=0.0,
                         help="Extra low-contrast defocus strength in [0, 1]. Useful with --degradation_preset soft_focus.")
+    parser.add_argument("--background_complexity", type=str, default="standard",
+                        choices=["standard", "complex"],
+                        help="Background complexity. 'complex' adds random curves, arcs, and concentric rings "
+                             "that act as hard-negative confusers.")
+    parser.add_argument("--overexposure_prob", type=float, default=0.0,
+                        help="Probability of applying overexposure simulation (gamma compression + brightness boost) "
+                             "per sample. Useful for training robustness against blown-out scenes. (default: 0.0)")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed for reproducibility")
     parser.add_argument("--visualize", action="store_true",

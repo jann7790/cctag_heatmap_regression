@@ -131,7 +131,6 @@ pip install -r requirements/cpu.txt
 uv run python -m py_compile \
   src/generate_cctag_dataset.py \
   src/visualize_random_labels.py \
-  src/train_cctag_heatmap.py \
   src/train_cctag_heatmap_ddp.py \
   src/infer_cctag_heatmap.py
 ```
@@ -175,26 +174,7 @@ uv run python src/visualize_random_labels.py \
 
 ## Train
 
-單機 DataParallel：
-
-```bash
-uv run python src/train_cctag_heatmap.py \
-  --dataset_dir ./outputs/datasets/ultimate_dataset \
-  --output_dir ./outputs/runs/experiment_03 \
-  --epochs 80 \
-  --batch_size 72 \
-  --lr 1e-3 \
-  --weight_decay 1e-4 \
-  --train_ratio 0.9 \
-  --num_workers 8 \
-  --seed 42 \
-  --input_width 640 \
-  --input_height 400 \
-  --save_every 10 \
-  --gpus 0,1,2
-```
-
-DDP：
+訓練統一使用 DDP（`train_cctag_heatmap_ddp.py`）：
 
 ```bash
 uv run torchrun --nproc_per_node=4 src/train_cctag_heatmap_ddp.py \
@@ -204,26 +184,63 @@ uv run torchrun --nproc_per_node=4 src/train_cctag_heatmap_ddp.py \
   --batch_size 18
 ```
 
-small backbone
-uv run torchrun --nproc_per_node=4 src/train_cctag_heatmap_ddp.py \
-    --backbone mobilenet_v3_small \
-    --dataset_dir ./outputs/training_sets/generated_training_sets/mixed_train_dataset \
-    --output_dir ./outputs/runs/experiment_mobilev3 \
-    --epochs 80 \
-    --batch_size 18
-    
-resnet:
+small backbone：
 
+```bash
 uv run torchrun --nproc_per_node=4 src/train_cctag_heatmap_ddp.py \
-    --dataset_dir ./outputs/training_sets/generated_training_sets/mixed_train_dataset \
-    --output_dir ./outputs/runs/experiment_resnet18_ddp \
-    --backbone resnet18 \
-    --epochs 80 \
-    --batch_size 18
+  --backbone mobilenet_v3_small \
+  --dataset_dir ./outputs/training_sets/generated_training_sets/mixed_train_dataset \
+  --output_dir ./outputs/runs/experiment_mobilev3 \
+  --epochs 80 \
+  --batch_size 18
+```
+
+resnet：
+
+```bash
+uv run torchrun --nproc_per_node=4 src/train_cctag_heatmap_ddp.py \
+  --dataset_dir ./outputs/training_sets/generated_training_sets/mixed_train_dataset \
+  --output_dir ./outputs/runs/experiment_resnet18_ddp \
+  --backbone resnet18 \
+  --epochs 80 \
+  --batch_size 18
+```
+
+### Focal Loss / OHEM
+
+針對 false positive 問題，訓練時可啟用 Focal Loss 或 OHEM 來讓 model 專注在難分辨的 pixel 上。
+
+**Focal Loss**（推薦）：對已經學會的 easy pixel（大片背景）自動降低 loss 權重，把學習力量集中在容易誤判的區域（過曝邊緣、曲線）。
+
+```bash
+uv run torchrun --nproc_per_node=4 src/train_cctag_heatmap_ddp.py \
+  --dataset_dir ./outputs/training_sets/generated_training_sets/mixed_train_dataset \
+  --output_dir ./outputs/runs/experiment_focal \
+  --focal_loss \
+  --focal_alpha 0.25 \
+  --focal_gamma 2.0 \
+  --epochs 80 \
+  --batch_size 18
+```
+
+- `--focal_alpha`：正負樣本權重平衡。0.25 表示負樣本（背景）權重較高，讓 model 更認真學「什麼不是 CCTag」。
+- `--focal_gamma`：focusing 強度。越大越忽略 easy pixel。預設 2.0 通常夠用。
+
+**OHEM**（更激進的替代方案）：直接丟掉 easy pixel，只用 loss 最大的 K% pixel 來更新 model。
+
+```bash
+uv run torchrun --nproc_per_node=4 src/train_cctag_heatmap_ddp.py \
+  --dataset_dir ./outputs/training_sets/generated_training_sets/mixed_train_dataset \
+  --output_dir ./outputs/runs/experiment_ohem \
+  --ohem_ratio 0.3 \
+  --epochs 80 \
+  --batch_size 18
+```
+
+- `--ohem_ratio 0.3`：只保留最難的 30% pixel。不要跟 `--focal_loss` 同時用。
 
 說明：
 
-- `--gpus 0,1,2` 用於 `src/train_cctag_heatmap.py` 的 DataParallel。
 - 所有 checkpoint 與訓練紀錄都應輸出到 `outputs/runs/...`。
 
 ## Inference
@@ -239,26 +256,6 @@ uv run python src/infer_cctag_heatmap.py \
   --eval
 ```
 
-另一個 checkpoint：
-
-```bash
-uv run python src/infer_cctag_heatmap.py \
-  --checkpoint ./outputs/runs/experiment_mixed_v4/best.pt \
-  --input ./outputs/testing/small_testing/images \
-  --output ./outputs/inference/results \
-  --vis \
-  --eval
-```
-
-```bash
-uv run python src/infer_cctag_heatmap.py \
-  --checkpoint ./outputs/runs/experiment_mixed_v4/best.pt \
-  --input assets/samples/cctag_reallife.png \
-  --output ./outputs/inference/results \
-  --vis \
-  --eval
-```
-
 單張圖片：
 
 ```bash
@@ -268,6 +265,23 @@ uv run python src/infer_cctag_heatmap.py \
   --output ./outputs/inference/reallife_demo \
   --vis
 ```
+
+### 即時 Tracking 模式（降低 False Positive）
+
+用 `--tracking_mode` 一次開啟所有保守設定：
+
+```bash
+uv run python src/infer_cctag_heatmap.py \
+  --checkpoint ./outputs/runs/experiment_focal/best.pt \
+  --input ./camera_feed \
+  --tracking_mode
+```
+
+`--tracking_mode` 等同於 `--threshold 0.65 --min_peak_sharpness 3.0 --temporal_window 5`。也可以個別調整：
+
+- `--min_peak_sharpness 3.0`：真的 CCTag 在 heatmap 上是尖銳的 Gaussian peak（sharpness > 3），過曝造成的 FP 是模糊的大面積 activation（sharpness < 2）。對推論速度幾乎無影響。
+- `--temporal_window 5`：連續 5 幀中要有 3 幀偵測到才接受，過濾掉單幀跳動的 FP。
+- `--threshold 0.65`：比預設 0.5 更保守的 peak 門檻。
 
 ## Batch Workflows
 

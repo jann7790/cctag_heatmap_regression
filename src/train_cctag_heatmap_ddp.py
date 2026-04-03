@@ -105,6 +105,15 @@ def parse_args() -> argparse.Namespace:
         choices=["efficientnet_b0", "mobilenet_v3_small", "resnet18"],
         help="Backbone architecture (default: efficientnet_b0).",
     )
+    parser.add_argument("--focal_loss", action="store_true",
+                        help="Replace BCE with Focal Loss to focus on hard false-positive pixels.")
+    parser.add_argument("--focal_alpha", type=float, default=0.25,
+                        help="Focal loss alpha (positive class weight). Default: 0.25.")
+    parser.add_argument("--focal_gamma", type=float, default=2.0,
+                        help="Focal loss gamma (focusing parameter). Default: 2.0.")
+    parser.add_argument("--ohem_ratio", type=float, default=0.0,
+                        help="Online Hard Example Mining: keep only the hardest K%% of pixels for loss. "
+                             "0.0 disables OHEM; 0.3 keeps the hardest 30%%. Only used when --focal_loss is not set.")
     return parser.parse_args()
 
 
@@ -306,12 +315,51 @@ class HeatmapDiceLoss(nn.Module):
         return 1.0 - dice.mean()
 
 
-class CombinedHeatmapLoss(nn.Module):
-    def __init__(self, center_weight: float = 0.1) -> None:
+class HeatmapFocalLoss(nn.Module):
+    """Focal loss for heatmap regression.
+
+    Down-weights easy background pixels and focuses learning on hard
+    false-positive-prone pixels (e.g. edges, curves, overexposed regions).
+    """
+
+    def __init__(self, alpha: float = 0.25, gamma: float = 2.0) -> None:
         super().__init__()
-        self.bce = nn.BCELoss()
+        self.alpha = alpha
+        self.gamma = gamma
+
+    def forward(self, prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        eps = 1e-7
+        pred = prediction.clamp(eps, 1.0 - eps)
+        bce = -(target * torch.log(pred) + (1.0 - target) * torch.log(1.0 - pred))
+        pt = target * pred + (1.0 - target) * (1.0 - pred)
+        focal_weight = (1.0 - pt) ** self.gamma
+        alpha_weight = target * self.alpha + (1.0 - target) * (1.0 - self.alpha)
+        loss = alpha_weight * focal_weight * bce
+        return loss.mean()
+
+
+class CombinedHeatmapLoss(nn.Module):
+    def __init__(self, center_weight: float = 0.1, use_focal: bool = False,
+                 focal_alpha: float = 0.25, focal_gamma: float = 2.0,
+                 ohem_ratio: float = 0.0) -> None:
+        super().__init__()
+        if use_focal:
+            self.pixel_loss = HeatmapFocalLoss(alpha=focal_alpha, gamma=focal_gamma)
+        else:
+            self.pixel_loss = nn.BCELoss(reduction="none" if ohem_ratio > 0 else "mean")
         self.dice = HeatmapDiceLoss()
         self.center_weight = center_weight
+        self.use_focal = use_focal
+        self.ohem_ratio = ohem_ratio
+
+    def _pixel_term(self, prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        if self.ohem_ratio > 0 and not self.use_focal:
+            per_pixel = self.pixel_loss(prediction, target)
+            flat = per_pixel.flatten()
+            k = max(1, int(flat.numel() * self.ohem_ratio))
+            topk_loss, _ = torch.topk(flat, k)
+            return topk_loss.mean()
+        return self.pixel_loss(prediction, target)
 
     def forward(
         self,
@@ -319,7 +367,7 @@ class CombinedHeatmapLoss(nn.Module):
         target: torch.Tensor,
         heatmap_centers: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        heatmap_loss = 0.5 * self.bce(prediction, target) + 0.5 * self.dice(prediction, target)
+        heatmap_loss = 0.5 * self._pixel_term(prediction, target) + 0.5 * self.dice(prediction, target)
         if heatmap_centers is not None:
             # Only apply center loss on positive samples (target heatmap has a real peak).
             # Negative samples should output a near-zero heatmap; forcing soft-argmax on
@@ -997,7 +1045,12 @@ def main() -> None:
     preview_batch(train_loader)
 
     model = build_model(heatmap_size=heatmap_size, device=device, rank=rank, world_size=world_size, backbone=args.backbone)
-    criterion = CombinedHeatmapLoss().to(device)
+    criterion = CombinedHeatmapLoss(
+        use_focal=args.focal_loss,
+        focal_alpha=args.focal_alpha,
+        focal_gamma=args.focal_gamma,
+        ohem_ratio=args.ohem_ratio,
+    ).to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=args.lr,

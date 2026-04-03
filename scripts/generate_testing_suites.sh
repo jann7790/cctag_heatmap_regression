@@ -90,4 +90,34 @@ generate_one "testing_extreme_mix" \
   --soft_focus_strength 1.0 \
   "${common_args[@]}"
 
+# --- False-positive stress tests ---
+
+generate_one "testing_overexposure_fp" \
+  --output_dir "${OUTPUT_ROOT}/testing_overexposure_fp" \
+  --seed 105 \
+  --marker_min 66 \
+  --marker_max 333 \
+  --occ_min 0.0 \
+  --occ_max 0.30 \
+  --partial_out_prob 0.15 \
+  --partial_out_max_ratio 0.25 \
+  --empty_negative_ratio 0.50 \
+  --boundary_target_ratio 0.10 \
+  --overexposure_prob 0.85 \
+  --background_complexity complex \
+  "${common_args[@]}"
+
+generate_one "testing_complex_negative" \
+  --output_dir "${OUTPUT_ROOT}/testing_complex_negative" \
+  --seed 106 \
+  --marker_min 66 \
+  --marker_max 333 \
+  --occ_min 0.0 \
+  --occ_max 0.0 \
+  --partial_out_prob 0.10 \
+  --partial_out_max_ratio 0.25 \
+  --negative_ratio 0.80 \
+  --background_complexity complex \
+  "${common_args[@]}"
+
 echo "==> testing suites ready under ${OUTPUT_ROOT}"

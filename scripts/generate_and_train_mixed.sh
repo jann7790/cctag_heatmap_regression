@@ -9,7 +9,7 @@ if [[ -z "${PYTHON_BIN:-}" ]]; then
   fi
 fi
 GENERATOR_SCRIPT="${GENERATOR_SCRIPT:-./scripts/generate_training_sets.sh}"
-TRAIN_SCRIPT="${TRAIN_SCRIPT:-./src/train_cctag_heatmap.py}"
+TRAIN_SCRIPT="${TRAIN_SCRIPT:-./src/train_cctag_heatmap_ddp.py}"
 
 TRAINING_ROOT="${TRAINING_ROOT:-./outputs/training_sets/generated_training_sets}"
 MIXED_DATASET_DIR="${MIXED_DATASET_DIR:-${TRAINING_ROOT}/mixed_train_dataset}"
@@ -78,8 +78,10 @@ BASE_DIR="${TRAINING_ROOT}/base_set"
 HARD_DIR="${TRAINING_ROOT}/hard_set"
 EXTREME_DIR="${TRAINING_ROOT}/extreme_set"
 SMALL_DIR="${TRAINING_ROOT}/small_set"
+HARD_NEG_DIR="${TRAINING_ROOT}/hard_negative_set"
+OVEREXPOSURE_DIR="${TRAINING_ROOT}/overexposure_set"
 
-for required_dir in "${BASE_DIR}" "${HARD_DIR}" "${EXTREME_DIR}" "${SMALL_DIR}"; do
+for required_dir in "${BASE_DIR}" "${HARD_DIR}" "${EXTREME_DIR}" "${SMALL_DIR}" "${HARD_NEG_DIR}" "${OVEREXPOSURE_DIR}"; do
   if [[ ! -d "${required_dir}" ]]; then
     echo "Missing expected dataset directory: ${required_dir}" >&2
     exit 1
@@ -87,14 +89,16 @@ for required_dir in "${BASE_DIR}" "${HARD_DIR}" "${EXTREME_DIR}" "${SMALL_DIR}";
 done
 
 echo "==> merging datasets into ${MIXED_DATASET_DIR}"
-merge_dataset_parts "${MIXED_DATASET_DIR}" "${BASE_DIR}" "${HARD_DIR}" "${EXTREME_DIR}" "${SMALL_DIR}"
+merge_dataset_parts "${MIXED_DATASET_DIR}" "${BASE_DIR}" "${HARD_DIR}" "${EXTREME_DIR}" "${SMALL_DIR}" "${HARD_NEG_DIR}" "${OVEREXPOSURE_DIR}"
 
-echo "==> starting training"
-"${PYTHON_BIN}" "${TRAIN_SCRIPT}" \
+NPROC="${NPROC:-4}"
+
+echo "==> starting training (DDP, nproc=${NPROC})"
+"${PYTHON_BIN}" -m torch.distributed.run --nproc_per_node="${NPROC}" "${TRAIN_SCRIPT}" \
   --dataset_dir "${MIXED_DATASET_DIR}" \
   --output_dir "${RUN_OUTPUT_DIR}" \
   --epochs 80 \
-  --batch_size 72 \
+  --batch_size 18 \
   --lr 1e-3 \
   --weight_decay 1e-4 \
   --train_ratio 0.9 \
@@ -103,4 +107,4 @@ echo "==> starting training"
   --input_width 640 \
   --input_height 400 \
   --save_every 10 \
-  --gpus 0,1,2
+  --focal_loss
