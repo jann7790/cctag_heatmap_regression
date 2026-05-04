@@ -30,7 +30,7 @@ common_args=(
   --output_size 640x400
   --marker_style cctag_source
   --num_rings 3
-  --heatmap_stride 8
+  --heatmap_stride 4
   --heatmap_sigma 2.0
   --partial_out_prob 0.25
   --partial_out_max_ratio 0.25
@@ -66,7 +66,13 @@ merge_dataset_parts() {
   local idx=0
   local part
   for part in "${parts[@]}"; do
-    cp "${part}/config.json" "${merged_dir}/config_parts/$(basename "${part}").json"
+    if [[ -f "${part}/config.json" ]]; then
+      cp "${part}/config.json" "${merged_dir}/config_parts/$(basename "${part}").json"
+    elif [[ -d "${part}/config_parts" ]]; then
+      for _cfg in "${part}"/config_parts/*.json; do
+        cp "${_cfg}" "${merged_dir}/config_parts/$(basename "${part}")_$(basename "${_cfg}")"
+      done
+    fi
     while IFS=, read -r filename rest; do
       local new_name
       new_name="$(printf '%06d' "${idx}")"
@@ -189,7 +195,7 @@ generate_one "hard_negative_set" \
   --output_size 640x400 \
   --marker_style cctag_source \
   --num_rings 3 \
-  --heatmap_stride 8 \
+  --heatmap_stride 4 \
   --heatmap_sigma 2.0 \
   --partial_out_prob 0.10 \
   --partial_out_max_ratio 0.25 \
@@ -214,11 +220,17 @@ generate_one "overexposure_set" \
   --output_size 640x400 \
   --marker_style cctag_source \
   --num_rings 3 \
-  --heatmap_stride 8 \
+  --heatmap_stride 4 \
   --heatmap_sigma 2.0 \
   --partial_out_prob 0.15 \
   --partial_out_max_ratio 0.25 \
   --occlusion_style aggressive
+
+MIXED_DIR="${MIXED_DIR:-${OUTPUT_ROOT}/mixed_train_dataset}"
+ensure_absent "${MIXED_DIR}"
+
+echo "==> merging all subsets into ${MIXED_DIR}"
+merge_dataset_parts "${MIXED_DIR}" "${BASE_DIR}" "${HARD_DIR}" "${EXTREME_DIR}" "${SMALL_DIR}" "${HARD_NEG_DIR}" "${OVEREXPOSURE_DIR}"
 
 echo "==> training sets ready under ${OUTPUT_ROOT}"
 echo "   - ${BASE_DIR}"
@@ -227,3 +239,4 @@ echo "   - ${EXTREME_DIR}"
 echo "   - ${SMALL_DIR}"
 echo "   - ${HARD_NEG_DIR}"
 echo "   - ${OVEREXPOSURE_DIR}"
+echo "   - ${MIXED_DIR} (merged, $(find "${MIXED_DIR}/images" -name '*.png' | wc -l) images)"

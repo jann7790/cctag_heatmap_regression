@@ -1584,8 +1584,8 @@ def main():
                         help="Exact fraction of pure negative samples in the dataset. Must be used with --boundary_target_ratio.")
     parser.add_argument("--boundary_target_ratio", type=float, default=None,
                         help="Exact fraction of boundary-clamped target samples in the dataset. Must be used with --empty_negative_ratio.")
-    parser.add_argument("--heatmap_stride", type=int, default=8,
-                        help="Downsampling factor for heatmap output, e.g. 8 gives WIDTH/8 x HEIGHT/8 heatmaps")
+    parser.add_argument("--heatmap_stride", type=int, default=4,
+                        help="Downsampling factor for heatmap output, e.g. 4 gives WIDTH/4 x HEIGHT/4 heatmaps")
     parser.add_argument("--heatmap_sigma", type=float, default=2.0,
                         help="Gaussian heatmap sigma in heatmap coordinates (default: 2.0)")
     parser.add_argument("--yolo_class_id", type=int, default=0,

@@ -114,6 +114,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ohem_ratio", type=float, default=0.0,
                         help="Online Hard Example Mining: keep only the hardest K%% of pixels for loss. "
                              "0.0 disables OHEM; 0.3 keeps the hardest 30%%. Only used when --focal_loss is not set.")
+    parser.add_argument("--offset_head", action="store_true",
+                        help="Add a 2-channel offset regression head (CenterNet-style) for sub-pixel center decoding.")
+    parser.add_argument("--offset_weight", type=float, default=1.0,
+                        help="Weight of the offset L1 loss term. Default: 1.0.")
     return parser.parse_args()
 
 
@@ -341,7 +345,7 @@ class HeatmapFocalLoss(nn.Module):
 class CombinedHeatmapLoss(nn.Module):
     def __init__(self, center_weight: float = 0.1, use_focal: bool = False,
                  focal_alpha: float = 0.25, focal_gamma: float = 2.0,
-                 ohem_ratio: float = 0.0) -> None:
+                 ohem_ratio: float = 0.0, offset_weight: float = 1.0) -> None:
         super().__init__()
         if use_focal:
             self.pixel_loss = HeatmapFocalLoss(alpha=focal_alpha, gamma=focal_gamma)
@@ -351,6 +355,7 @@ class CombinedHeatmapLoss(nn.Module):
         self.center_weight = center_weight
         self.use_focal = use_focal
         self.ohem_ratio = ohem_ratio
+        self.offset_weight = offset_weight
 
     def _pixel_term(self, prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         if self.ohem_ratio > 0 and not self.use_focal:
@@ -366,20 +371,38 @@ class CombinedHeatmapLoss(nn.Module):
         prediction: torch.Tensor,
         target: torch.Tensor,
         heatmap_centers: torch.Tensor | None = None,
+        offset_pred: torch.Tensor | None = None,
     ) -> torch.Tensor:
         heatmap_loss = 0.5 * self._pixel_term(prediction, target) + 0.5 * self.dice(prediction, target)
+        total = heatmap_loss
+
+        # Sub-pixel offset L1 loss (CenterNet-style): supervise offset only at the GT peak,
+        # only on positive samples. Offset target = heatmap_center - round(heatmap_center).
+        if offset_pred is not None and heatmap_centers is not None:
+            pos_mask = target.flatten(1).max(dim=1).values > 0.1
+            if pos_mask.any():
+                centers_pos = heatmap_centers[pos_mask]                     # (P, 2)
+                offset_pos = offset_pred[pos_mask]                          # (P, 2, H, W)
+                _, _, H, W = offset_pos.shape
+                peak_int = centers_pos.round().long()
+                peak_int[:, 0].clamp_(0, W - 1)
+                peak_int[:, 1].clamp_(0, H - 1)
+                offset_target = centers_pos - peak_int.float()              # (P, 2) in [-0.5, 0.5]
+                p_idx = torch.arange(offset_pos.shape[0], device=offset_pos.device)
+                offset_at_peak = offset_pos[p_idx, :, peak_int[:, 1], peak_int[:, 0]]  # (P, 2)
+                offset_loss = nn.functional.smooth_l1_loss(offset_at_peak, offset_target)
+                total = total + self.offset_weight * offset_loss
+
         if heatmap_centers is not None:
-            # Only apply center loss on positive samples (target heatmap has a real peak).
-            # Negative samples should output a near-zero heatmap; forcing soft-argmax on
-            # them causes the model to always predict a peak even for negatives.
-            pos_mask = target.flatten(1).max(dim=1).values > 0.1  # (B,)
+            # Soft-argmax center loss (legacy term, only on positive samples).
+            pos_mask = target.flatten(1).max(dim=1).values > 0.1
             if pos_mask.any():
                 pred_centers = spatial_soft_argmax(prediction[pos_mask])
                 center_loss = nn.functional.smooth_l1_loss(
                     pred_centers, heatmap_centers[pos_mask]
                 )
-                return heatmap_loss + self.center_weight * center_loss
-        return heatmap_loss
+                total = total + self.center_weight * center_loss
+        return total
 
 
 class CCTagNet(nn.Module):
@@ -396,12 +419,13 @@ class CCTagNet(nn.Module):
     SKIP_INDICES = (1, 2, 3, 4)
     SKIP_CHANNELS = (16, 24, 40, 80)
 
-    def __init__(self, heatmap_size: tuple[int, int]) -> None:
+    def __init__(self, heatmap_size: tuple[int, int], use_offset_head: bool = False) -> None:
         super().__init__()
         efficientnet_b0, EfficientNet_B0_Weights = ensure_torchvision()
         backbone = efficientnet_b0(weights=EfficientNet_B0_Weights.DEFAULT)
         self.encoder = backbone.features
         self.heatmap_height, self.heatmap_width = heatmap_size
+        self.use_offset_head = use_offset_head
 
         # Decoder: 4 upsample stages with skip-connection concatenation
         # stage 1: up 32→16, cat features[4] (80ch)
@@ -414,6 +438,8 @@ class CCTagNet(nn.Module):
         self.dec4 = self._dec_block(64 + 16, 32)
 
         self.head = nn.Sequential(nn.Conv2d(32, 1, kernel_size=1), nn.Sigmoid())
+        if use_offset_head:
+            self.offset_head = nn.Conv2d(32, 2, kernel_size=1)
 
     @staticmethod
     def _dec_block(in_ch: int, out_ch: int) -> nn.Sequential:
@@ -438,21 +464,30 @@ class CCTagNet(nn.Module):
             skip = nn.functional.interpolate(skip, size=x.shape[2:], mode="bilinear", align_corners=False)
         return torch.cat([x, skip], dim=1)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         bottleneck, (s16, s24, s40, s80) = self._encode(x)
 
         x = self.dec1(self._up_cat(bottleneck, s80))
         x = self.dec2(self._up_cat(x, s40))
         x = self.dec3(self._up_cat(x, s24))
         x = self.dec4(self._up_cat(x, s16))
-        x = self.head(x)
+        feat = x
 
-        return nn.functional.interpolate(
-            x,
+        heatmap = nn.functional.interpolate(
+            self.head(feat),
             size=(self.heatmap_height, self.heatmap_width),
             mode="bilinear",
             align_corners=False,
         )
+        if self.use_offset_head:
+            offset = nn.functional.interpolate(
+                self.offset_head(feat),
+                size=(self.heatmap_height, self.heatmap_width),
+                mode="bilinear",
+                align_corners=False,
+            )
+            return heatmap, offset
+        return heatmap
 
 
 class CCTagNetMobileV3(nn.Module):
@@ -470,18 +505,21 @@ class CCTagNetMobileV3(nn.Module):
     SKIP_CHANNELS = (16, 16, 24, 48)
     BOTTLENECK_CHANNELS = 576
 
-    def __init__(self, heatmap_size: tuple[int, int]) -> None:
+    def __init__(self, heatmap_size: tuple[int, int], use_offset_head: bool = False) -> None:
         super().__init__()
         mobilenet_v3_small, MobileNet_V3_Small_Weights = ensure_mobilenet_v3_small()
         backbone = mobilenet_v3_small(weights=MobileNet_V3_Small_Weights.DEFAULT)
         self.encoder = backbone.features
         self.heatmap_height, self.heatmap_width = heatmap_size
+        self.use_offset_head = use_offset_head
 
         self.dec1 = self._dec_block(self.BOTTLENECK_CHANNELS + 48, 128)
         self.dec2 = self._dec_block(128 + 24, 64)
         self.dec3 = self._dec_block(64 + 16, 32)
         self.dec4 = self._dec_block(32 + 16, 16)
         self.head = nn.Sequential(nn.Conv2d(16, 1, kernel_size=1), nn.Sigmoid())
+        if use_offset_head:
+            self.offset_head = nn.Conv2d(16, 2, kernel_size=1)
 
     @staticmethod
     def _dec_block(in_ch: int, out_ch: int) -> nn.Sequential:
@@ -506,17 +544,24 @@ class CCTagNetMobileV3(nn.Module):
             skip = nn.functional.interpolate(skip, size=x.shape[2:], mode="bilinear", align_corners=False)
         return torch.cat([x, skip], dim=1)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         bottleneck, (s16_s2, s16_s4, s24, s48) = self._encode(x)
         x = self.dec1(self._up_cat(bottleneck, s48))
         x = self.dec2(self._up_cat(x, s24))
         x = self.dec3(self._up_cat(x, s16_s4))
         x = self.dec4(self._up_cat(x, s16_s2))
-        x = self.head(x)
-        return nn.functional.interpolate(
-            x, size=(self.heatmap_height, self.heatmap_width),
+        feat = x
+        heatmap = nn.functional.interpolate(
+            self.head(feat), size=(self.heatmap_height, self.heatmap_width),
             mode="bilinear", align_corners=False,
         )
+        if self.use_offset_head:
+            offset = nn.functional.interpolate(
+                self.offset_head(feat), size=(self.heatmap_height, self.heatmap_width),
+                mode="bilinear", align_corners=False,
+            )
+            return heatmap, offset
+        return heatmap
 
 
 class CCTagNetResNet18(nn.Module):
@@ -530,7 +575,7 @@ class CCTagNetResNet18(nn.Module):
     Bottleneck (layer4) → 512ch, stride 32
     """
 
-    def __init__(self, heatmap_size: tuple[int, int]) -> None:
+    def __init__(self, heatmap_size: tuple[int, int], use_offset_head: bool = False) -> None:
         super().__init__()
         resnet18, ResNet18_Weights = ensure_resnet18()
         backbone = resnet18(weights=ResNet18_Weights.DEFAULT)
@@ -545,12 +590,15 @@ class CCTagNetResNet18(nn.Module):
         self.layer3 = backbone.layer3
         self.layer4 = backbone.layer4
         self.heatmap_height, self.heatmap_width = heatmap_size
+        self.use_offset_head = use_offset_head
 
         self.dec1 = self._dec_block(512 + 256, 256)
         self.dec2 = self._dec_block(256 + 128, 128)
         self.dec3 = self._dec_block(128 + 64, 64)
         self.dec4 = self._dec_block(64 + 64, 32)
         self.head = nn.Sequential(nn.Conv2d(32, 1, kernel_size=1), nn.Sigmoid())
+        if use_offset_head:
+            self.offset_head = nn.Conv2d(32, 2, kernel_size=1)
 
     @staticmethod
     def _dec_block(in_ch: int, out_ch: int) -> nn.Sequential:
@@ -576,19 +624,28 @@ class CCTagNetResNet18(nn.Module):
         bottleneck = self.layer4(s256_s16)
         return bottleneck, (s64_s2, s64_s4, s128_s8, s256_s16)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         bottleneck, (s64_s2, s64_s4, s128_s8, s256_s16) = self._encode(x)
         x = self.dec1(self._up_cat(bottleneck, s256_s16))
         x = self.dec2(self._up_cat(x, s128_s8))
         x = self.dec3(self._up_cat(x, s64_s4))
         x = self.dec4(self._up_cat(x, s64_s2))
-        x = self.head(x)
-        return nn.functional.interpolate(
-            x,
+        feat = x
+        heatmap = nn.functional.interpolate(
+            self.head(feat),
             size=(self.heatmap_height, self.heatmap_width),
             mode="bilinear",
             align_corners=False,
         )
+        if self.use_offset_head:
+            offset = nn.functional.interpolate(
+                self.offset_head(feat),
+                size=(self.heatmap_height, self.heatmap_width),
+                mode="bilinear",
+                align_corners=False,
+            )
+            return heatmap, offset
+        return heatmap
 
 
 def split_dataset(dataset: Dataset[Any], train_ratio: float, seed: int) -> tuple[Subset[Any], Subset[Any]]:
@@ -664,55 +721,54 @@ def create_dataloaders(
     return train_loader, val_loader, len(dataset), (dataset.heatmap_height, dataset.heatmap_width), train_sampler
 
 
-def decode_heatmap_centers(heatmaps: torch.Tensor) -> torch.Tensor:
-    batch_size, _, _height, width = heatmaps.shape
+def decode_heatmap_centers(heatmaps: torch.Tensor, offsets: torch.Tensor | None = None) -> torch.Tensor:
+    """Peak localization (batched, GPU-friendly).
+
+    If `offsets` (B, 2, H, W) is given, decode as integer argmax + offset[peak] (CenterNet style).
+    Otherwise fall back to weighted centroid around the argmax peak.
+    """
+    batch_size, _, height, width = heatmaps.shape
     hm = heatmaps.squeeze(1)
 
     flat_indices = hm.view(batch_size, -1).argmax(dim=1)
     py = torch.div(flat_indices, width, rounding_mode="floor")
     px = flat_indices % width
 
-    padded = nn.functional.pad(hm, (1, 1, 1, 1), mode="replicate")
-    px_p = px + 1
-    py_p = py + 1
-    b = torch.arange(batch_size, device=hm.device)
+    if offsets is not None:
+        b_idx = torch.arange(batch_size, device=hm.device)
+        off = offsets[b_idx, :, py, px]  # (B, 2)
+        results_x = px.float() + off[:, 0]
+        results_y = py.float() + off[:, 1]
+        return torch.stack((results_x, results_y), dim=1)
 
-    p11 = padded[b, py_p, px_p]
-    p10 = padded[b, py_p, px_p - 1]
-    p12 = padded[b, py_p, px_p + 1]
-    p01 = padded[b, py_p - 1, px_p]
-    p21 = padded[b, py_p + 1, px_p]
+    radius = 2
+    padded = nn.functional.pad(hm, (radius, radius, radius, radius), mode="replicate")
+    results_x = torch.zeros(batch_size, device=hm.device)
+    results_y = torch.zeros(batch_size, device=hm.device)
+    for i in range(batch_size):
+        cy, cx = int(py[i].item()), int(px[i].item())
+        region = padded[i, cy:cy + 2 * radius + 1, cx:cx + 2 * radius + 1]
+        total = region.sum()
+        if total < 1e-12:
+            results_x[i] = float(cx)
+            results_y[i] = float(cy)
+            continue
+        yy = torch.arange(cy - radius, cy + radius + 1, device=hm.device, dtype=hm.dtype)
+        xx = torch.arange(cx - radius, cx + radius + 1, device=hm.device, dtype=hm.dtype)
+        grid_y, grid_x = torch.meshgrid(yy, xx, indexing="ij")
+        results_x[i] = (grid_x * region).sum() / total
+        results_y[i] = (grid_y * region).sum() / total
 
-    dx = 0.5 * (p12 - p10)
-    dy = 0.5 * (p21 - p01)
-    dxx = p12 - 2.0 * p11 + p10
-    dyy = p21 - 2.0 * p11 + p01
-    dxy = 0.25 * (
-        padded[b, py_p + 1, px_p + 1]
-        - padded[b, py_p + 1, px_p - 1]
-        - padded[b, py_p - 1, px_p + 1]
-        + padded[b, py_p - 1, px_p - 1]
-    )
-
-    det = dxx * dyy - dxy * dxy
-    valid = det.abs() > 1e-6
-
-    delta_x = torch.zeros_like(dx)
-    delta_y = torch.zeros_like(dy)
-    delta_x[valid] = -(dyy[valid] * dx[valid] - dxy[valid] * dy[valid]) / det[valid]
-    delta_y[valid] = -(-dxy[valid] * dx[valid] + dxx[valid] * dy[valid]) / det[valid]
-    delta_x = delta_x.clamp(-0.5, 0.5)
-    delta_y = delta_y.clamp(-0.5, 0.5)
-
-    return torch.stack((px.float() + delta_x, py.float() + delta_y), dim=1)
+    return torch.stack((results_x, results_y), dim=1)
 
 
 def compute_center_distance_sum(
     prediction: torch.Tensor,
     target_centers_px: torch.Tensor,
     input_size: tuple[int, int],
+    offsets: torch.Tensor | None = None,
 ) -> tuple[float, int]:
-    pred_centers = decode_heatmap_centers(prediction)
+    pred_centers = decode_heatmap_centers(prediction, offsets=offsets)
     input_width, input_height = input_size
     heatmap_height, heatmap_width = prediction.shape[-2:]
     scale_x = input_width / float(heatmap_width)
@@ -747,6 +803,12 @@ def safe_divide(numerator: float, denominator: float) -> float:
     return numerator / denominator
 
 
+def _split_pred(out: torch.Tensor | tuple[torch.Tensor, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor | None]:
+    if isinstance(out, tuple):
+        return out[0], out[1]
+    return out, None
+
+
 def train_one_epoch(
     model: nn.Module,
     loader: DataLoader[Any],
@@ -764,8 +826,8 @@ def train_one_epoch(
         heatmap_centers = batch["heatmap_center"].to(device, non_blocking=True)
 
         optimizer.zero_grad(set_to_none=True)
-        predictions = model(images)
-        loss = criterion(predictions, targets, heatmap_centers=heatmap_centers)
+        predictions, offset_pred = _split_pred(model(images))
+        loss = criterion(predictions, targets, heatmap_centers=heatmap_centers, offset_pred=offset_pred)
         loss.backward()
         optimizer.step()
 
@@ -801,16 +863,18 @@ def validate(
         targets = batch["heatmap"].to(device, non_blocking=True)
         centers = batch["center"].to(device, non_blocking=True)
 
-        predictions = model(images)
+        predictions, offset_pred = _split_pred(model(images))
         loss = criterion(predictions, targets)
         pos_mask = targets.flatten(1).max(dim=1).values > 0.1
         center_distance_sum = 0.0
         center_distance_count = 0
         if pos_mask.any():
+            offsets_pos = offset_pred[pos_mask] if offset_pred is not None else None
             center_distance_sum, center_distance_count = compute_center_distance_sum(
                 predictions[pos_mask],
                 centers[pos_mask],
                 input_size,
+                offsets=offsets_pos,
             )
         batch_tp, batch_fp, batch_fn, batch_tn = compute_detection_counts(predictions, targets)
 
@@ -907,6 +971,10 @@ def write_run_config(
         "seed": args.seed,
         "device": str(device),
         "world_size": world_size,
+        "use_offset_head": bool(getattr(args, "offset_head", False)),
+        "offset_weight": float(getattr(args, "offset_weight", 1.0)),
+        "use_focal": bool(getattr(args, "focal_loss", False)),
+        "backbone": getattr(args, "backbone", "efficientnet_b0"),
     }
     (output_dir / "run_config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
 
@@ -1008,16 +1076,17 @@ def setup_logger(output_dir: Path) -> logging.Logger:
     return logger
 
 
-def build_model(heatmap_size: tuple[int, int], device: torch.device, rank: int, world_size: int, backbone: str = "efficientnet_b0") -> nn.Module:
+def build_model(heatmap_size: tuple[int, int], device: torch.device, rank: int, world_size: int,
+                backbone: str = "efficientnet_b0", use_offset_head: bool = False) -> nn.Module:
     # Rank 0 loads pretrained weights first so other ranks can reuse the local cache.
     if world_size > 1 and rank != 0:
         dist.barrier()
     if backbone == "mobilenet_v3_small":
-        model = CCTagNetMobileV3(heatmap_size=heatmap_size).to(device)
+        model = CCTagNetMobileV3(heatmap_size=heatmap_size, use_offset_head=use_offset_head).to(device)
     elif backbone == "resnet18":
-        model = CCTagNetResNet18(heatmap_size=heatmap_size).to(device)
+        model = CCTagNetResNet18(heatmap_size=heatmap_size, use_offset_head=use_offset_head).to(device)
     else:
-        model = CCTagNet(heatmap_size=heatmap_size).to(device)
+        model = CCTagNet(heatmap_size=heatmap_size, use_offset_head=use_offset_head).to(device)
     if world_size > 1 and rank == 0:
         dist.barrier()
     if world_size > 1:
@@ -1044,12 +1113,14 @@ def main() -> None:
 
     preview_batch(train_loader)
 
-    model = build_model(heatmap_size=heatmap_size, device=device, rank=rank, world_size=world_size, backbone=args.backbone)
+    model = build_model(heatmap_size=heatmap_size, device=device, rank=rank, world_size=world_size,
+                        backbone=args.backbone, use_offset_head=args.offset_head)
     criterion = CombinedHeatmapLoss(
         use_focal=args.focal_loss,
         focal_alpha=args.focal_alpha,
         focal_gamma=args.focal_gamma,
         ohem_ratio=args.ohem_ratio,
+        offset_weight=args.offset_weight,
     ).to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(),

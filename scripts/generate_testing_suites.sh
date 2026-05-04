@@ -15,7 +15,7 @@ TEST_COUNT="${TEST_COUNT:-1000}"
 common_args=(
   --num_images "${TEST_COUNT}"
   --output_size 640x400
-  --heatmap_stride 8
+  --heatmap_stride 4
   --heatmap_sigma 2.0
   --marker_style cctag_source
   --num_rings 3
