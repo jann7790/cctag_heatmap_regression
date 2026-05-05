@@ -172,24 +172,103 @@ uv run python src/visualize_random_labels.py \
   --output ./outputs/tmp/demo_small_testing_labels.jpg
 ```
 
+## Train / Val / Test Split
+
+現在推薦流程是：
+
+- synthetic dataset 保持完整，直接當成 training source 之一。
+- real-world dataset 要切成至少 `train` 和 `test`。
+- 更建議切成 `train` / `val` / `test` 三份。
+- training script 直接吃 multiple sources，不要再先把 synthetic 和 real-world physically merge 成一包。
+
+### 為什麼不要把 `val` 和 `test` 用同一份
+
+- `val` 是訓練中拿來選模型、調參數、看 overfitting 的。
+- `test` 應該是最後才看的 held-out 評估集。
+- 如果 `val == test`，你會不自覺對 test set overfit，最後分數會偏樂觀。
+
+如果資料真的很少，短期內可以先用同一份資料做 `val/test`，但那一份就只能當 `val` 看，不能再把結果當成正式 test 結論。
+
+### 推薦切法
+
+以 real-world dataset 為主：
+
+- `real_world_train`: 拿來訓練
+- `real_world_val`: 拿來選 checkpoint / 調參
+- `real_world_test`: 最後才評估
+
+synthetic dataset 通常不需要再切 `test` 給最終報告；它主要是訓練來源。
+
+### 用現有 split script 切資料
+
+先從完整 real-world 切出 `train+val` 與 `test`：
+
+```bash
+uv run python scripts/split_train_test.py \
+  --src outputs/real_world_stride4 \
+  --train_dir outputs/real_world_stride4_trainval \
+  --test_dir outputs/real_world_stride4_test \
+  --test_ratio 0.15 \
+  --seed 42
+```
+
+再把 `trainval` 繼續切成 `train` 與 `val`：
+
+```bash
+uv run python scripts/split_train_test.py \
+  --src outputs/real_world_stride4_trainval \
+  --train_dir outputs/real_world_stride4_train \
+  --test_dir outputs/real_world_stride4_val \
+  --test_ratio 0.15 \
+  --seed 43
+```
+
+這樣大約會得到：
+
+- `train`: 72.25%
+- `val`: 12.75%
+- `test`: 15%
+
 ## Train
 
-訓練統一使用 DDP（`train_cctag_heatmap_ddp.py`）：
+訓練統一使用 DDP（`train_cctag_heatmap_ddp.py`）。
+
+### 推薦做法：multi-source training
+
+直接把 synthetic 和 real-world train split 一起丟進 training，不要先 merge：
 
 ```bash
 uv run torchrun --nproc_per_node=4 src/train_cctag_heatmap_ddp.py \
-  --dataset_dir ./outputs/training_sets/generated_training_sets/mixed_train_dataset \
+  --train_dataset_dir ./outputs/training_sets/stride4_v2/mixed_train_dataset \
+  --train_dataset_dir ./outputs/real_world_stride4_train \
+  --val_dataset_dir ./outputs/real_world_stride4_val \
+  --output_dir ./outputs/runs/experiment_multi_source_ddp \
+  --epochs 80 \
+  --batch_size 18
+```
+
+### 舊做法：單一 dataset + 內部分 train/val
+
+如果你只有一包 dataset，還是可以沿用舊介面：
+
+```bash
+uv run torchrun --nproc_per_node=4 src/train_cctag_heatmap_ddp.py \
+  --dataset_dir ./outputs/training_sets/stride4_v2/mixed_train_dataset \
   --output_dir ./outputs/runs/experiment_mixed_ddp \
   --epochs 80 \
   --batch_size 18
 ```
+
+但這種模式只適合 quick experiment，不適合拿來做正式的 real-world 評估。
 
 small backbone：
 
 ```bash
 uv run torchrun --nproc_per_node=4 src/train_cctag_heatmap_ddp.py \
   --backbone mobilenet_v3_small \
-  --dataset_dir ./outputs/training_sets/generated_training_sets/mixed_train_dataset \
+  --train_dataset_dir ./outputs/training_sets/stride4_v2/mixed_train_dataset \
+  --train_dataset_dir ./outputs/real_world_stride4_train \
+  --val_dataset_dir ./outputs/real_world_stride4_val \
   --output_dir ./outputs/runs/experiment_mobilev3 \
   --epochs 80 \
   --batch_size 18
@@ -199,9 +278,11 @@ resnet：
 
 ```bash
 uv run torchrun --nproc_per_node=4 src/train_cctag_heatmap_ddp.py \
-  --dataset_dir ./outputs/training_sets/generated_training_sets/mixed_train_dataset \
-  --output_dir ./outputs/runs/experiment_resnet18_ddp \
   --backbone resnet18 \
+  --train_dataset_dir ./outputs/training_sets/stride4_v2/mixed_train_dataset \
+  --train_dataset_dir ./outputs/real_world_stride4_train \
+  --val_dataset_dir ./outputs/real_world_stride4_val \
+  --output_dir ./outputs/runs/experiment_resnet18_ddp \
   --epochs 80 \
   --batch_size 18
 ```
@@ -214,7 +295,9 @@ uv run torchrun --nproc_per_node=4 src/train_cctag_heatmap_ddp.py \
 
 ```bash
 uv run torchrun --nproc_per_node=4 src/train_cctag_heatmap_ddp.py \
-  --dataset_dir ./outputs/training_sets/generated_training_sets/mixed_train_dataset \
+  --train_dataset_dir ./outputs/training_sets/stride4_v2/mixed_train_dataset \
+  --train_dataset_dir ./outputs/real_world_stride4_train \
+  --val_dataset_dir ./outputs/real_world_stride4_val \
   --output_dir ./outputs/runs/experiment_focal \
   --focal_loss \
   --focal_alpha 0.25 \
@@ -230,7 +313,9 @@ uv run torchrun --nproc_per_node=4 src/train_cctag_heatmap_ddp.py \
 
 ```bash
 uv run torchrun --nproc_per_node=4 src/train_cctag_heatmap_ddp.py \
-  --dataset_dir ./outputs/training_sets/generated_training_sets/mixed_train_dataset \
+  --train_dataset_dir ./outputs/training_sets/stride4_v2/mixed_train_dataset \
+  --train_dataset_dir ./outputs/real_world_stride4_train \
+  --val_dataset_dir ./outputs/real_world_stride4_val \
   --output_dir ./outputs/runs/experiment_ohem \
   --ohem_ratio 0.3 \
   --epochs 80 \
@@ -243,14 +328,29 @@ uv run torchrun --nproc_per_node=4 src/train_cctag_heatmap_ddp.py \
 
 - 所有 checkpoint 與訓練紀錄都應輸出到 `outputs/runs/...`。
 
-## Inference
+## Test / Inference
 
-資料夾推論 + heatmap + overlay + evaluation：
+### 正式 test
+
+訓練完成後，用 held-out `real_world_test` 做最終評估：
+
+```bash
+uv run python src/infer_cctag_heatmap.py \
+  --checkpoint ./outputs/runs/experiment_multi_source_ddp/best.pt \
+  --input ./outputs/real_world_stride4_test/images \
+  --dataset_dir ./outputs/real_world_stride4_test \
+  --output ./outputs/inference/real_world_test_eval \
+  --vis \
+  --eval
+```
+
+### 單一資料夾推論 + evaluation
 
 ```bash
 uv run python src/infer_cctag_heatmap.py \
   --checkpoint ./outputs/runs/experiment_mixed_ddp/best.pt \
-  --input ./outputs/testing/small_testing/images \
+  --input ./outputs/real_world_stride4_test/images \
+  --dataset_dir ./outputs/real_world_stride4_test \
   --output ./outputs/inference/results_ddp \
   --vis \
   --eval
@@ -291,22 +391,22 @@ uv run python src/infer_cctag_heatmap.py \
 bash scripts/generate_training_sets.sh
 ```
 
-產生 testing suites：
+切 dataset：
 
 ```bash
-bash scripts/generate_testing_suites.sh
+uv run python scripts/split_train_test.py --help
 ```
 
-產生 mixed training set 並直接開訓：
+如果你想把 synthetic / real-world split 後再產生 combined train/test 目錄，也可以用：
 
 ```bash
-bash scripts/generate_and_train_mixed.sh
+uv run python scripts/build_combined_train_test.py --help
 ```
 
 ## Output Conventions
 
 - `outputs/datasets/`: 一般資料集。
-- `outputs/testing/`: 壓力測試集與 testing suites。
+- `outputs/testing/`: 額外壓力測試集或 hard test suites。
 - `outputs/training_sets/`: 由 workflow 腳本生成的訓練資料組合。
 - `outputs/runs/`: checkpoint、training logs。
 - `outputs/inference/`: heatmap、overlay、evaluation results。

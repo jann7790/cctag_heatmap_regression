@@ -18,7 +18,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--dataset_dir",
         type=Path,
-        default=Path("./outputs/datasets/cctag_dataset"),
+        default=Path("./outputs/visulaize/base_set"),
         help="Dataset root containing images/, labels_yolo/, and optional labels.csv.",
     )
     parser.add_argument(
@@ -34,16 +34,10 @@ def parse_args() -> argparse.Namespace:
         help="Random seed for reproducible sampling.",
     )
     parser.add_argument(
-        "--output",
+        "--output_dir",
         type=Path,
-        default=Path("./outputs/tmp/random_label_check.jpg"),
-        help="Path to save the visualization grid.",
-    )
-    parser.add_argument(
-        "--tile_size",
-        type=int,
-        default=320,
-        help="Preview size for each tile in the output grid.",
+        default=Path("./outputs/tmp/random_label_check"),
+        help="Directory to save the visualizations.",
     )
     parser.add_argument(
         "--show_yolo_bbox",
@@ -82,7 +76,13 @@ def load_csv_labels(csv_path: Path) -> dict[str, dict[str, str]]:
 
 
 def draw_fitted_ellipse(image: np.ndarray, row: dict[str, str]) -> None:
-    required = ["ellipse_cx", "ellipse_cy", "ellipse_a", "ellipse_b", "ellipse_angle_rad"]
+    required = [
+        "ellipse_cx",
+        "ellipse_cy",
+        "ellipse_a",
+        "ellipse_b",
+        "ellipse_angle_rad",
+    ]
     if not all(row.get(key) for key in required):
         return
 
@@ -144,18 +144,19 @@ def draw_center_point(image: np.ndarray, row: dict[str, str]) -> None:
     if not x_value or not y_value:
         return
 
-    cv2.drawMarker(
-        image,
-        (int(round(float(x_value))), int(round(float(y_value)))),
-        (0, 0, 255),
-        cv2.MARKER_CROSS,
-        14,
-        2,
-        cv2.LINE_AA,
-    )
+    cx = int(round(float(x_value)))
+    cy = int(round(float(y_value)))
+
+    cv2.circle(image, (cx, cy), 6, (0, 255, 0), -1)
+    cv2.circle(image, (cx, cy), 8, (0, 0, 0), 2)
 
 
-def draw_label_legend(image: np.ndarray, row: dict[str, str] | None, class_id: str | None, show_yolo_bbox: bool) -> None:
+def draw_label_legend(
+    image: np.ndarray,
+    row: dict[str, str] | None,
+    class_id: str | None,
+    show_yolo_bbox: bool,
+) -> None:
     text_lines = []
     if show_yolo_bbox and class_id is not None:
         text_lines.append(f"YOLO class {class_id}")
@@ -197,6 +198,7 @@ def draw_label_legend(image: np.ndarray, row: dict[str, str] | None, class_id: s
 def draw_labels(
     image_path: Path,
     label_path: Path,
+    heatmap_path: Path | None,
     csv_row: dict[str, str] | None,
     show_yolo_bbox: bool,
 ) -> np.ndarray:
@@ -206,10 +208,34 @@ def draw_labels(
 
     h, w = image.shape[:2]
     overlay = image.copy()
+
+    if heatmap_path and heatmap_path.exists():
+        if heatmap_path.suffix == ".npy":
+            heatmap_raw = np.load(heatmap_path).astype(np.float32)
+            # Resize from strided shape to original image shape
+            heatmap_resized = cv2.resize(
+                heatmap_raw, (w, h), interpolation=cv2.INTER_LINEAR
+            )
+            heatmap_u8 = np.clip(heatmap_resized * 255, 0, 255).astype(np.uint8)
+            heatmap_color = cv2.applyColorMap(heatmap_u8, cv2.COLORMAP_JET)
+            overlay = cv2.addWeighted(overlay, 0.6, heatmap_color, 0.4, 0)
+        else:
+            heatmap = cv2.imread(str(heatmap_path), cv2.IMREAD_GRAYSCALE)
+            if heatmap is not None:
+                heatmap_resized = cv2.resize(
+                    heatmap, (w, h), interpolation=cv2.INTER_LINEAR
+                )
+                heatmap_color = cv2.applyColorMap(heatmap_resized, cv2.COLORMAP_JET)
+                overlay = cv2.addWeighted(overlay, 0.6, heatmap_color, 0.4, 0)
+
     class_id = None
 
     if show_yolo_bbox and label_path.exists():
-        lines = [line.strip() for line in label_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        lines = [
+            line.strip()
+            for line in label_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
         for line in lines:
             parts = line.split()
             if len(parts) != 5:
@@ -248,45 +274,23 @@ def draw_labels(
         draw_center_point(overlay, csv_row)
         draw_fitted_ellipse(overlay, csv_row)
 
-    filename = image_path.name
-    cv2.rectangle(overlay, (0, 0), (w, 28), (32, 32, 32), -1)
-    cv2.putText(
-        overlay,
-        filename,
-        (8, 20),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.55,
-        (255, 255, 255),
-        1,
-        cv2.LINE_AA,
-    )
     draw_label_legend(overlay, csv_row, class_id, show_yolo_bbox)
     return overlay
-
-
-def make_grid(images: list[np.ndarray], tile_size: int) -> np.ndarray:
-    resized = [cv2.resize(img, (tile_size, tile_size), interpolation=cv2.INTER_AREA) for img in images]
-    cols = min(5, len(resized))
-    rows = math.ceil(len(resized) / cols)
-
-    grid = np.full((rows * tile_size, cols * tile_size, 3), 24, dtype=np.uint8)
-    for idx, img in enumerate(resized):
-        row = idx // cols
-        col = idx % cols
-        y0 = row * tile_size
-        x0 = col * tile_size
-        grid[y0:y0 + tile_size, x0:x0 + tile_size] = img
-    return grid
 
 
 def main() -> None:
     args = parse_args()
     image_dir = args.dataset_dir / "images"
     label_dir = args.dataset_dir / "labels_yolo"
+    heatmap_dir = args.dataset_dir / "heatmaps"
     csv_rows = load_csv_labels(args.dataset_dir / "labels.csv")
 
     image_paths = sorted(
-        [path for path in image_dir.iterdir() if path.is_file() and path.suffix.lower() in {".png", ".jpg", ".jpeg"}]
+        [
+            path
+            for path in image_dir.iterdir()
+            if path.is_file() and path.suffix.lower() in {".png", ".jpg", ".jpeg"}
+        ]
     )
     if not image_paths:
         raise ValueError(f"No images found in {image_dir}")
@@ -295,28 +299,39 @@ def main() -> None:
     sample_count = min(args.num_samples, len(image_paths))
     sampled_images = rng.sample(image_paths, sample_count)
 
-    visualized = []
-    for image_path in sampled_images:
-        label_path = label_dir / f"{image_path.stem}.txt"
-        visualized.append(
-            draw_labels(
-                image_path,
-                label_path,
-                csv_rows.get(image_path.stem),
-                args.show_yolo_bbox,
-            )
-        )
+    args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    grid = make_grid(visualized, args.tile_size)
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    success = cv2.imwrite(str(args.output), grid)
-    if not success:
-        raise ValueError(f"Failed to write output image: {args.output}")
-
-    print(f"Saved visualization to: {args.output}")
+    print(f"Saving visualizations to: {args.output_dir}")
     print("Sampled files:")
     for image_path in sampled_images:
-        print(f"  - {image_path.name}")
+        label_path = label_dir / f"{image_path.stem}.txt"
+
+        heatmap_path = heatmap_dir / f"{image_path.stem}.npy"
+        if not heatmap_path.exists():
+            heatmap_path = None
+            for ext in [".png", ".jpg", ".jpeg"]:
+                hp = heatmap_dir / f"{image_path.stem}{ext}"
+                if hp.exists():
+                    heatmap_path = hp
+                    break
+
+        # Handle fallback for csv reading just in case stem vs name issue exists
+        csv_row = csv_rows.get(image_path.name) or csv_rows.get(image_path.stem)
+
+        visualized = draw_labels(
+            image_path,
+            label_path,
+            heatmap_path,
+            csv_row,
+            args.show_yolo_bbox,
+        )
+
+        out_path = args.output_dir / f"{image_path.stem}_vis.jpg"
+        success = cv2.imwrite(str(out_path), visualized)
+        if not success:
+            raise ValueError(f"Failed to write output image: {out_path}")
+
+        print(f"  - {out_path.name}")
 
 
 if __name__ == "__main__":

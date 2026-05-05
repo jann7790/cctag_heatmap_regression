@@ -10,6 +10,14 @@ Examples:
     --output_dir ./outputs/runs/experiment_mixed_ddp \
     --epochs 80 \
     --batch_size 18
+
+  torchrun --nproc_per_node=4 src/train_cctag_heatmap_ddp.py \
+    --train_dataset_dir ./outputs/training_sets/stride4_v2/mixed_train_dataset \
+    --train_dataset_dir ./outputs/real_world_stride4_train \
+    --val_dataset_dir ./outputs/real_world_stride4_test \
+    --output_dir ./outputs/runs/experiment_multi_source_ddp \
+    --epochs 80 \
+    --batch_size 18
 """
 
 import argparse
@@ -30,7 +38,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 from torch.nn.parallel import DistributedDataParallel
-from torch.utils.data import DataLoader, Dataset, Subset
+from torch.utils.data import ConcatDataset, DataLoader, Dataset, Subset
 from torch.utils.data.distributed import DistributedSampler
 
 
@@ -58,7 +66,23 @@ def parse_args() -> argparse.Namespace:
         "--dataset_dir",
         type=Path,
         default=Path("./outputs/datasets/cctag_dataset"),
-        help="Dataset root containing images/, heatmaps/, and labels.csv.",
+        help="Single dataset root. Used as a fallback when explicit train/val dataset dirs are not provided.",
+    )
+    parser.add_argument(
+        "--train_dataset_dir",
+        dest="train_dataset_dirs",
+        action="append",
+        type=Path,
+        default=[],
+        help="Training dataset root. Repeat this flag to train from multiple dataset sources.",
+    )
+    parser.add_argument(
+        "--val_dataset_dir",
+        dest="val_dataset_dirs",
+        action="append",
+        type=Path,
+        default=[],
+        help="Validation dataset root. Repeat this flag to validate on multiple dataset sources.",
     )
     parser.add_argument(
         "--output_dir",
@@ -75,7 +99,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--lr", type=float, default=1e-3, help="Initial learning rate.")
     parser.add_argument("--weight_decay", type=float, default=1e-4, help="AdamW weight decay.")
-    parser.add_argument("--train_ratio", type=float, default=0.9, help="Train split ratio.")
+    parser.add_argument(
+        "--train_ratio",
+        type=float,
+        default=0.9,
+        help="Train split ratio. Only used when --train_dataset_dir/--val_dataset_dir are not provided.",
+    )
     parser.add_argument("--num_workers", type=int, default=4, help="DataLoader worker count per process.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
     parser.add_argument("--input_width", type=int, default=640, help="Resized input width.")
@@ -667,16 +696,82 @@ def split_dataset(dataset: Dataset[Any], train_ratio: float, seed: int) -> tuple
     return Subset(dataset, train_indices), Subset(dataset, val_indices)
 
 
+def get_dataset_heatmap_size(dataset: CCTagHeatmapDataset) -> tuple[int, int]:
+    if dataset.heatmap_height is None or dataset.heatmap_width is None:
+        raise ValueError(f"Failed to infer heatmap size from dataset: {dataset.dataset_dir}")
+    return dataset.heatmap_height, dataset.heatmap_width
+
+
+def build_dataset_collection(
+    dataset_dirs: list[Path],
+    input_size: tuple[int, int],
+    split_name: str,
+) -> tuple[Dataset[Any], int, tuple[int, int]]:
+    datasets = [CCTagHeatmapDataset(dataset_dir=dataset_dir, input_size=input_size) for dataset_dir in dataset_dirs]
+    if not datasets:
+        raise ValueError(f"No datasets provided for {split_name}")
+
+    heatmap_size = get_dataset_heatmap_size(datasets[0])
+    for dataset in datasets[1:]:
+        current_size = get_dataset_heatmap_size(dataset)
+        if current_size != heatmap_size:
+            raise ValueError(
+                f"Incompatible heatmap size in {dataset.dataset_dir}: expected {heatmap_size}, got {current_size}"
+            )
+
+    if len(datasets) == 1:
+        merged_dataset: Dataset[Any] = datasets[0]
+    else:
+        merged_dataset = ConcatDataset(datasets)
+    return merged_dataset, sum(len(dataset) for dataset in datasets), heatmap_size
+
+
+def resolve_dataset_sources(args: argparse.Namespace) -> tuple[list[Path] | None, list[Path] | None]:
+    train_dirs = list(args.train_dataset_dirs)
+    val_dirs = list(args.val_dataset_dirs)
+
+    if train_dirs or val_dirs:
+        if not train_dirs or not val_dirs:
+            raise ValueError(
+                "Provide both --train_dataset_dir and --val_dataset_dir when using explicit multi-source datasets."
+            )
+        return train_dirs, val_dirs
+
+    return None, None
+
+
 def create_dataloaders(
     args: argparse.Namespace,
     rank: int,
     world_size: int,
 ) -> tuple[DataLoader[Any], DataLoader[Any], int, tuple[int, int], DistributedSampler[Any] | None]:
-    dataset = CCTagHeatmapDataset(
-        dataset_dir=args.dataset_dir,
-        input_size=(args.input_width, args.input_height),
-    )
-    train_set, val_set = split_dataset(dataset, args.train_ratio, args.seed)
+    explicit_train_dirs, explicit_val_dirs = resolve_dataset_sources(args)
+    if explicit_train_dirs is not None and explicit_val_dirs is not None:
+        train_set, train_size, heatmap_size = build_dataset_collection(
+            explicit_train_dirs,
+            input_size=(args.input_width, args.input_height),
+            split_name="train",
+        )
+        val_set, val_size, val_heatmap_size = build_dataset_collection(
+            explicit_val_dirs,
+            input_size=(args.input_width, args.input_height),
+            split_name="val",
+        )
+        if val_heatmap_size != heatmap_size:
+            raise ValueError(
+                f"Train/val heatmap size mismatch: train={heatmap_size}, val={val_heatmap_size}"
+            )
+        dataset_size = train_size + val_size
+    else:
+        dataset = CCTagHeatmapDataset(
+            dataset_dir=args.dataset_dir,
+            input_size=(args.input_width, args.input_height),
+        )
+        train_set, val_set = split_dataset(dataset, args.train_ratio, args.seed)
+        train_size = len(train_set)
+        val_size = len(val_set)
+        dataset_size = len(dataset)
+        heatmap_size = get_dataset_heatmap_size(dataset)
 
     train_sampler = None
     val_sampler = None
@@ -716,9 +811,7 @@ def create_dataloaders(
         drop_last=False,
         persistent_workers=args.num_workers > 0,
     )
-    if dataset.heatmap_height is None or dataset.heatmap_width is None:
-        raise ValueError("Failed to infer heatmap size from dataset")
-    return train_loader, val_loader, len(dataset), (dataset.heatmap_height, dataset.heatmap_width), train_sampler
+    return train_loader, val_loader, dataset_size, heatmap_size, train_sampler
 
 
 def decode_heatmap_centers(heatmaps: torch.Tensor, offsets: torch.Tensor | None = None) -> torch.Tensor:
@@ -955,6 +1048,8 @@ def write_run_config(
     output_dir.mkdir(parents=True, exist_ok=True)
     config = {
         "dataset_dir": str(args.dataset_dir),
+        "train_dataset_dirs": [str(path) for path in args.train_dataset_dirs],
+        "val_dataset_dirs": [str(path) for path in args.val_dataset_dirs],
         "dataset_size": dataset_size,
         "train_size": train_size,
         "val_size": val_size,
@@ -968,6 +1063,7 @@ def write_run_config(
         "lr": args.lr,
         "weight_decay": args.weight_decay,
         "train_ratio": args.train_ratio,
+        "uses_explicit_train_val_datasets": bool(args.train_dataset_dirs or args.val_dataset_dirs),
         "seed": args.seed,
         "device": str(device),
         "world_size": world_size,

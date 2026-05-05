@@ -128,6 +128,34 @@ def validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> 
         parser.error("--soft_focus_strength must be between 0.0 and 1.0.")
     if not 0.0 <= args.overexposure_prob <= 1.0:
         parser.error("--overexposure_prob must be between 0.0 and 1.0.")
+    if args.blur_min < 0 or args.blur_max < 0:
+        parser.error("--blur_min and --blur_max must be >= 0.")
+    if args.blur_min > args.blur_max:
+        parser.error("--blur_min cannot exceed --blur_max.")
+    if args.noise_std_min < 0.0 or args.noise_std_max < 0.0:
+        parser.error("--noise_std_min and --noise_std_max must be >= 0.")
+    if args.noise_std_min > args.noise_std_max:
+        parser.error("--noise_std_min cannot exceed --noise_std_max.")
+    if args.brightness_min > args.brightness_max:
+        parser.error("--brightness_min cannot exceed --brightness_max.")
+    if args.contrast_min <= 0.0:
+        parser.error("--contrast_min must be > 0.")
+    if args.contrast_min > args.contrast_max:
+        parser.error("--contrast_min cannot exceed --contrast_max.")
+    if not 0.0 <= args.motion_blur_prob <= 1.0:
+        parser.error("--motion_blur_prob must be between 0.0 and 1.0.")
+    if not 0.0 <= args.scintillation_prob <= 1.0:
+        parser.error("--scintillation_prob must be between 0.0 and 1.0.")
+    if args.occluder_templates != "auto":
+        valid_tpls = {"single", "stack_v", "stack_h", "scatter",
+                      "tshape", "lshape", "cross", "hshape", "eshape"}
+        for tpl in args.occluder_templates.split(","):
+            tpl = tpl.strip()
+            if tpl and tpl not in valid_tpls:
+                parser.error(
+                    f"--occluder_templates contains unknown template '{tpl}'. "
+                    f"Valid options: {sorted(valid_tpls)} or 'auto'."
+                )
 
 
 @lru_cache(maxsize=None)
@@ -353,6 +381,8 @@ def apply_random_occlusion(
     occlusion_range: tuple[float, float] = (0.0, 0.6),
     adversarial_prob: float = 0.15,
     occlusion_style: str = "standard",
+    occ_distribution: str = "uniform",
+    occluder_templates: str = "auto",
 ) -> tuple[np.ndarray, float]:
     """
     Apply random occlusion over the marker area.
@@ -368,7 +398,17 @@ def apply_random_occlusion(
         occlusion_ratio: approximate ratio of marker area occluded
     """
     h, w = img.shape[:2]
-    target_ratio = random.uniform(*occlusion_range)
+    lo, hi = occlusion_range
+    if hi <= lo:
+        target_ratio = lo
+    else:
+        if occ_distribution == "beta_high":
+            u = random.betavariate(2.5, 1.0)
+        elif occ_distribution == "beta_low":
+            u = random.betavariate(1.0, 2.5)
+        else:
+            u = random.random()
+        target_ratio = lo + (hi - lo) * u
 
     if target_ratio < 0.02:
         return img, 0.0
@@ -407,74 +447,222 @@ def apply_random_occlusion(
             ry1, ry2 = ry2, ry1
         return rx1, ry1, rx2, ry2
 
-    def draw_structured_center_occluder() -> None:
-        shape_mask = np.zeros((h, w), dtype=np.uint8)
-        ratio_scale = min(max((target_ratio - 0.45) / 0.55, 0.0), 1.0)
+    def fill_rect(mask: np.ndarray, fx1: float, fy1: float, fx2: float, fy2: float) -> None:
+        rx1, ry1, rx2, ry2 = clamp_rect(fx1, fy1, fx2, fy2)
+        cv2.rectangle(mask, (rx1, ry1), (rx2, ry2), 255, -1)
 
-        # Model real rigid occluders such as grippers or frame arms:
-        # a thick horizontal beam entering from the side plus one or two vertical legs.
+    def template_single(mask: np.ndarray, ratio_scale: float) -> None:
+        # One big rectangle covering the marker. Random aspect.
+        aspect_pick = random.random()
+        if aspect_pick < 0.33:
+            rect_w = random.uniform(2.1, 2.6 + 0.4 * ratio_scale) * r
+            rect_h = random.uniform(0.55, 0.95 + 0.25 * ratio_scale) * r
+        elif aspect_pick < 0.66:
+            rect_w = random.uniform(0.55, 0.95 + 0.25 * ratio_scale) * r
+            rect_h = random.uniform(2.1, 2.6 + 0.4 * ratio_scale) * r
+        else:
+            side = random.uniform(1.4, 2.0 + 0.4 * ratio_scale) * r
+            rect_w = side
+            rect_h = side
+        ox = random.uniform(-0.35, 0.35) * r
+        oy = random.uniform(-0.35, 0.35) * r
+        fill_rect(mask,
+                  cx + ox - rect_w / 2.0, cy + oy - rect_h / 2.0,
+                  cx + ox + rect_w / 2.0, cy + oy + rect_h / 2.0)
+
+    def template_stack_v(mask: np.ndarray, ratio_scale: float) -> None:
+        # 2-3 vertically stacked rectangles, similar widths.
+        n = random.randint(2, 3)
+        bar_w = random.uniform(1.2, 1.7 + 0.4 * ratio_scale) * r
+        ox = random.uniform(-0.25, 0.25) * r
+        total_h = random.uniform(2.0, 2.6 + 0.4 * ratio_scale) * r
+        top_y = cy - total_h / 2.0 + random.uniform(-0.1, 0.1) * r
+        cursor = top_y
+        for _ in range(n):
+            bar_h = total_h / n * random.uniform(0.7, 1.1)
+            local_w = bar_w * random.uniform(0.85, 1.15)
+            local_ox = ox + random.uniform(-0.1, 0.1) * r
+            fill_rect(mask,
+                      cx + local_ox - local_w / 2.0, cursor,
+                      cx + local_ox + local_w / 2.0, cursor + bar_h)
+            cursor += bar_h - random.uniform(0.0, 0.08) * r  # slight overlap
+
+    def template_stack_h(mask: np.ndarray, ratio_scale: float) -> None:
+        # 2-3 horizontally stacked rectangles.
+        n = random.randint(2, 3)
+        bar_h = random.uniform(1.2, 1.7 + 0.4 * ratio_scale) * r
+        oy = random.uniform(-0.25, 0.25) * r
+        total_w = random.uniform(2.0, 2.6 + 0.4 * ratio_scale) * r
+        left_x = cx - total_w / 2.0 + random.uniform(-0.1, 0.1) * r
+        cursor = left_x
+        for _ in range(n):
+            bar_w = total_w / n * random.uniform(0.7, 1.1)
+            local_h = bar_h * random.uniform(0.85, 1.15)
+            local_oy = oy + random.uniform(-0.1, 0.1) * r
+            fill_rect(mask,
+                      cursor, cy + local_oy - local_h / 2.0,
+                      cursor + bar_w, cy + local_oy + local_h / 2.0)
+            cursor += bar_w - random.uniform(0.0, 0.08) * r
+
+    def template_scatter(mask: np.ndarray, ratio_scale: float) -> None:
+        # 3-5 random small/medium rectangles around the marker.
+        n = random.randint(3, 5)
+        for _ in range(n):
+            patch_w = random.uniform(0.35, 0.95 + 0.4 * ratio_scale) * r
+            patch_h = random.uniform(0.35, 0.95 + 0.4 * ratio_scale) * r
+            ox = random.uniform(-1.0, 1.0) * r
+            oy = random.uniform(-1.0, 1.0) * r
+            fill_rect(mask,
+                      cx + ox - patch_w / 2.0, cy + oy - patch_h / 2.0,
+                      cx + ox + patch_w / 2.0, cy + oy + patch_h / 2.0)
+
+    def template_tshape(mask: np.ndarray, ratio_scale: float) -> None:
+        # Original T/TT structure: top bar entering from the side + 1-2 legs + optional foot/connector/stem.
         top_bar_width = random.uniform(1.35, 1.9 + 0.9 * ratio_scale) * r
         top_bar_height = random.uniform(0.42, 0.62 + 0.18 * ratio_scale) * r
         left_shift = random.uniform(0.45, 1.05 + 0.35 * ratio_scale) * r
         top_y = cy - random.uniform(0.1, 0.45) * r
-
-        x1, y1, x2, y2 = clamp_rect(
-            cx - top_bar_width / 2.0 - left_shift,
-            top_y - top_bar_height / 2.0,
-            cx + top_bar_width / 2.0,
-            top_y + top_bar_height / 2.0,
-        )
-        cv2.rectangle(shape_mask, (x1, y1), (x2, y2), 255, -1)
-
+        fill_rect(mask,
+                  cx - top_bar_width / 2.0 - left_shift, top_y - top_bar_height / 2.0,
+                  cx + top_bar_width / 2.0, top_y + top_bar_height / 2.0)
         leg_count = 2 if random.random() < (0.75 + 0.2 * ratio_scale) else 1
         leg_offsets = [-0.42, 0.2] if leg_count == 2 else [random.uniform(-0.15, 0.18)]
         for leg_idx, offset_multiplier in enumerate(leg_offsets):
             leg_width = random.uniform(0.3, 0.55 + 0.25 * ratio_scale) * r
             leg_height = random.uniform(1.1, 1.8 + 0.55 * ratio_scale) * r
             leg_offset_x = offset_multiplier * r
-            x1, y1, x2, y2 = clamp_rect(
-                cx + leg_offset_x - leg_width / 2.0,
-                top_y,
-                cx + leg_offset_x + leg_width / 2.0,
-                top_y + leg_height,
-            )
-            cv2.rectangle(shape_mask, (x1, y1), (x2, y2), 255, -1)
-
+            fill_rect(mask,
+                      cx + leg_offset_x - leg_width / 2.0, top_y,
+                      cx + leg_offset_x + leg_width / 2.0, top_y + leg_height)
             if leg_idx == 0 and random.random() < 0.65:
                 foot_width = random.uniform(0.16, 0.34) * r
                 foot_height = random.uniform(0.55, 1.0) * r
-                fx1, fy1, fx2, fy2 = clamp_rect(
-                    cx + leg_offset_x - foot_width / 2.0,
-                    top_y + leg_height * 0.42,
-                    cx + leg_offset_x + foot_width / 2.0,
-                    top_y + leg_height * 0.42 + foot_height,
-                )
-                cv2.rectangle(shape_mask, (fx1, fy1), (fx2, fy2), 255, -1)
-
+                fill_rect(mask,
+                          cx + leg_offset_x - foot_width / 2.0,
+                          top_y + leg_height * 0.42,
+                          cx + leg_offset_x + foot_width / 2.0,
+                          top_y + leg_height * 0.42 + foot_height)
         if random.random() < (0.35 + 0.45 * ratio_scale):
             connector_width = random.uniform(0.18, 0.42) * r
             connector_height = random.uniform(0.18, 0.34) * r
             connector_x = cx - random.uniform(0.05, 0.35) * r
             connector_y = cy + random.uniform(0.0, 0.38) * r
-            x1, y1, x2, y2 = clamp_rect(
-                connector_x - connector_width / 2.0,
-                connector_y - connector_height / 2.0,
-                connector_x + connector_width / 2.0,
-                connector_y + connector_height / 2.0,
-            )
-            cv2.rectangle(shape_mask, (x1, y1), (x2, y2), 255, -1)
-
+            fill_rect(mask,
+                      connector_x - connector_width / 2.0, connector_y - connector_height / 2.0,
+                      connector_x + connector_width / 2.0, connector_y + connector_height / 2.0)
         if random.random() < (0.18 + 0.32 * ratio_scale):
             stem_width = random.uniform(0.18, 0.38) * r
             stem_height = random.uniform(0.65, 1.1) * r
-            x1, y1, x2, y2 = clamp_rect(
-                cx - stem_width / 2.0,
-                cy - 0.05 * r,
-                cx + stem_width / 2.0,
-                cy - 0.05 * r + stem_height,
-            )
-            cv2.rectangle(shape_mask, (x1, y1), (x2, y2), 255, -1)
+            fill_rect(mask,
+                      cx - stem_width / 2.0, cy - 0.05 * r,
+                      cx + stem_width / 2.0, cy - 0.05 * r + stem_height)
 
+    def template_lshape(mask: np.ndarray, ratio_scale: float) -> None:
+        # Two perpendicular bars meeting at a corner.
+        bar_thick = random.uniform(0.45, 0.7 + 0.2 * ratio_scale) * r
+        v_height = random.uniform(1.6, 2.2 + 0.4 * ratio_scale) * r
+        h_width = random.uniform(1.6, 2.2 + 0.4 * ratio_scale) * r
+        # Corner at one of the four corners of the marker bbox region
+        corner_x = cx + random.choice([-1.0, 1.0]) * random.uniform(0.3, 0.7) * r
+        corner_y = cy + random.choice([-1.0, 1.0]) * random.uniform(0.3, 0.7) * r
+        # Vertical bar
+        v_dir = -1.0 if corner_y > cy else 1.0
+        fill_rect(mask,
+                  corner_x - bar_thick / 2.0, corner_y,
+                  corner_x + bar_thick / 2.0, corner_y + v_dir * v_height)
+        # Horizontal bar
+        h_dir = -1.0 if corner_x > cx else 1.0
+        fill_rect(mask,
+                  corner_x, corner_y - bar_thick / 2.0,
+                  corner_x + h_dir * h_width, corner_y + bar_thick / 2.0)
+
+    def template_cross(mask: np.ndarray, ratio_scale: float) -> None:
+        # Plus / cross of two perpendicular bars centered near marker.
+        h_w = random.uniform(2.0, 2.6 + 0.4 * ratio_scale) * r
+        h_h = random.uniform(0.4, 0.7 + 0.2 * ratio_scale) * r
+        v_w = random.uniform(0.4, 0.7 + 0.2 * ratio_scale) * r
+        v_h = random.uniform(2.0, 2.6 + 0.4 * ratio_scale) * r
+        ox = random.uniform(-0.25, 0.25) * r
+        oy = random.uniform(-0.25, 0.25) * r
+        fill_rect(mask,
+                  cx + ox - h_w / 2.0, cy + oy - h_h / 2.0,
+                  cx + ox + h_w / 2.0, cy + oy + h_h / 2.0)
+        fill_rect(mask,
+                  cx + ox - v_w / 2.0, cy + oy - v_h / 2.0,
+                  cx + ox + v_w / 2.0, cy + oy + v_h / 2.0)
+
+    def template_hshape(mask: np.ndarray, ratio_scale: float) -> None:
+        # Two vertical bars + one horizontal connector between them (H or II).
+        bar_w = random.uniform(0.4, 0.65 + 0.2 * ratio_scale) * r
+        bar_h = random.uniform(2.0, 2.6 + 0.4 * ratio_scale) * r
+        gap = random.uniform(1.0, 1.6 + 0.3 * ratio_scale) * r
+        oy = random.uniform(-0.2, 0.2) * r
+        # Left bar
+        fill_rect(mask,
+                  cx - gap / 2.0 - bar_w / 2.0, cy + oy - bar_h / 2.0,
+                  cx - gap / 2.0 + bar_w / 2.0, cy + oy + bar_h / 2.0)
+        # Right bar
+        fill_rect(mask,
+                  cx + gap / 2.0 - bar_w / 2.0, cy + oy - bar_h / 2.0,
+                  cx + gap / 2.0 + bar_w / 2.0, cy + oy + bar_h / 2.0)
+        # Connector
+        conn_h = random.uniform(0.3, 0.55 + 0.15 * ratio_scale) * r
+        conn_oy = random.uniform(-0.6, 0.6) * r
+        fill_rect(mask,
+                  cx - gap / 2.0, cy + conn_oy - conn_h / 2.0,
+                  cx + gap / 2.0, cy + conn_oy + conn_h / 2.0)
+
+    def template_eshape(mask: np.ndarray, ratio_scale: float) -> None:
+        # One vertical bar + three short horizontal bars (E or comb).
+        bar_w = random.uniform(0.4, 0.65 + 0.2 * ratio_scale) * r
+        bar_h = random.uniform(2.2, 2.8 + 0.4 * ratio_scale) * r
+        ox = random.uniform(-0.6, 0.6) * r
+        side = random.choice([-1.0, 1.0])
+        # Spine
+        fill_rect(mask,
+                  cx + ox - bar_w / 2.0, cy - bar_h / 2.0,
+                  cx + ox + bar_w / 2.0, cy + bar_h / 2.0)
+        # Three teeth
+        tooth_w = random.uniform(1.0, 1.5 + 0.3 * ratio_scale) * r
+        tooth_h = random.uniform(0.3, 0.5 + 0.15 * ratio_scale) * r
+        for k in (-1, 0, 1):
+            ty = cy + k * (bar_h * 0.4)
+            tx_inner = cx + ox + side * bar_w / 2.0
+            tx_outer = tx_inner + side * tooth_w
+            fill_rect(mask,
+                      min(tx_inner, tx_outer), ty - tooth_h / 2.0,
+                      max(tx_inner, tx_outer), ty + tooth_h / 2.0)
+
+    template_fns = {
+        "single": template_single,
+        "stack_v": template_stack_v,
+        "stack_h": template_stack_h,
+        "scatter": template_scatter,
+        "tshape": template_tshape,
+        "lshape": template_lshape,
+        "cross": template_cross,
+        "hshape": template_hshape,
+        "eshape": template_eshape,
+    }
+
+    if occluder_templates and occluder_templates != "auto":
+        allowed = [t.strip() for t in occluder_templates.split(",") if t.strip() in template_fns]
+    else:
+        if target_ratio < 0.55:
+            allowed = ["single", "scatter", "lshape"]
+        elif target_ratio < 0.80:
+            allowed = ["stack_v", "stack_h", "lshape", "cross", "tshape", "hshape"]
+        else:
+            allowed = ["tshape", "hshape", "eshape", "stack_v", "stack_h", "cross", "single"]
+
+    if not allowed:
+        allowed = ["tshape"]
+
+    def draw_structured_center_occluder() -> None:
+        shape_mask = np.zeros((h, w), dtype=np.uint8)
+        ratio_scale = min(max((target_ratio - 0.45) / 0.55, 0.0), 1.0)
+        chosen = random.choice(allowed)
+        template_fns[chosen](shape_mask, ratio_scale)
         apply_mask(shape_mask)
 
     aggressive_style = occlusion_style in {"aggressive", "center_heavy"}
@@ -741,25 +929,27 @@ def apply_degradation(
         img += noise
 
     if soft_focus_strength > 0.0:
-        # Simulate low-contrast, out-of-focus capture by compressing local contrast
-        # toward a heavily blurred base layer and adding mild veiling glare.
-        base_sigma = 10.0 + 24.0 * soft_focus_strength
+        # Simulate low-contrast, out-of-focus capture. Use s_hi = s ** 0.7 for the
+        # gray-pull axes so the high-strength end (s >= 0.7) is no longer saturated.
+        s = soft_focus_strength
+        s_hi = s ** 0.7
+        base_sigma = 8.0 + 32.0 * s
         base_layer = cv2.GaussianBlur(img, (0, 0), base_sigma)
-        detail_gain = max(0.03, 0.30 - 0.22 * soft_focus_strength)
+        detail_gain = max(0.02, 0.32 - 0.28 * s)
         img = base_layer + (img - base_layer) * detail_gain
 
-        glow_sigma = 16.0 + 28.0 * soft_focus_strength
+        glow_sigma = 14.0 + 36.0 * s
         glow = cv2.GaussianBlur(img, (0, 0), glow_sigma)
-        glow_mix = 0.16 + 0.22 * soft_focus_strength
+        glow_mix = 0.14 + 0.34 * s_hi
         img = cv2.addWeighted(img, 1.0 - glow_mix, glow, glow_mix, 0.0)
 
         # Pull the whole image toward a mid-gray target so black rings stop
         # looking like clean black print and become hazy low-contrast bands.
-        target_gray = 172.0 + 12.0 * soft_focus_strength
-        gray_mix = 0.16 + 0.26 * soft_focus_strength
+        target_gray = 168.0 + 28.0 * s_hi
+        gray_mix = 0.14 + 0.46 * s_hi
         img = img * (1.0 - gray_mix) + target_gray * gray_mix
 
-        lift = 12.0 + 20.0 * soft_focus_strength
+        lift = 10.0 + 32.0 * s_hi
         img = img + lift
 
     return np.clip(img, 0, 255).astype(np.uint8)
@@ -1056,6 +1246,12 @@ def generate_empty_negative_sample(
     soft_focus_strength: float,
     background_complexity: str = "standard",
     overexposure_prob: float = 0.0,
+    blur_range: tuple[int, int] = (0, 5),
+    noise_std_range: tuple[float, float] = (0.0, 25.0),
+    brightness_range: tuple[float, float] = (-40.0, 40.0),
+    contrast_range: tuple[float, float] = (0.6, 1.4),
+    motion_blur_prob: float = 0.2,
+    scintillation_prob: float = 0.15,
 ) -> tuple[np.ndarray, np.ndarray, dict]:
     output_w, output_h = output_size
     heatmap_w = output_w // heatmap_stride
@@ -1068,6 +1264,12 @@ def generate_empty_negative_sample(
                                        background_complexity=background_complexity)
     bg = apply_degradation(
         bg,
+        blur_range=blur_range,
+        noise_std_range=noise_std_range,
+        brightness_range=brightness_range,
+        contrast_range=contrast_range,
+        motion_blur_prob=motion_blur_prob,
+        scintillation_prob=scintillation_prob,
         degradation_preset=degradation_preset,
         soft_focus_strength=soft_focus_strength,
         overexposure_prob=overexposure_prob,
@@ -1095,6 +1297,14 @@ def generate_marker_sample(
     soft_focus_strength: float = 0.0,
     background_complexity: str = "standard",
     overexposure_prob: float = 0.0,
+    blur_range: tuple[int, int] = (0, 5),
+    noise_std_range: tuple[float, float] = (0.0, 25.0),
+    brightness_range: tuple[float, float] = (-40.0, 40.0),
+    contrast_range: tuple[float, float] = (0.6, 1.4),
+    motion_blur_prob: float = 0.2,
+    scintillation_prob: float = 0.15,
+    occ_distribution: str = "uniform",
+    occluder_templates: str = "auto",
 ) -> tuple[np.ndarray, np.ndarray, dict]:
     output_w, output_h = output_size
     heatmap_w = output_w // heatmap_stride
@@ -1135,12 +1345,20 @@ def generate_marker_sample(
         marker_radius,
         occlusion_range=occlusion_range,
         occlusion_style=occlusion_style,
+        occ_distribution=occ_distribution,
+        occluder_templates=occluder_templates,
     )
 
     bg, _, _ = composite_on_background(img, bg_size=(render_h, render_w),
                                        background_complexity=background_complexity)
     bg = apply_degradation(
         bg,
+        blur_range=blur_range,
+        noise_std_range=noise_std_range,
+        brightness_range=brightness_range,
+        contrast_range=contrast_range,
+        motion_blur_prob=motion_blur_prob,
+        scintillation_prob=scintillation_prob,
         degradation_preset=degradation_preset,
         soft_focus_strength=soft_focus_strength,
         overexposure_prob=overexposure_prob,
@@ -1255,6 +1473,14 @@ def generate_single_sample(
     soft_focus_strength: float = 0.0,
     background_complexity: str = "standard",
     overexposure_prob: float = 0.0,
+    blur_range: tuple[int, int] = (0, 5),
+    noise_std_range: tuple[float, float] = (0.0, 25.0),
+    brightness_range: tuple[float, float] = (-40.0, 40.0),
+    contrast_range: tuple[float, float] = (0.6, 1.4),
+    motion_blur_prob: float = 0.2,
+    scintillation_prob: float = 0.15,
+    occ_distribution: str = "uniform",
+    occluder_templates: str = "auto",
 ) -> tuple[np.ndarray, np.ndarray, dict]:
     """
     Generate one training sample: image + heatmap + metadata.
@@ -1276,6 +1502,12 @@ def generate_single_sample(
             soft_focus_strength=soft_focus_strength,
             background_complexity=background_complexity,
             overexposure_prob=overexposure_prob,
+            blur_range=blur_range,
+            noise_std_range=noise_std_range,
+            brightness_range=brightness_range,
+            contrast_range=contrast_range,
+            motion_blur_prob=motion_blur_prob,
+            scintillation_prob=scintillation_prob,
         )
 
     desired_target_clamped = None
@@ -1310,6 +1542,14 @@ def generate_single_sample(
             soft_focus_strength=soft_focus_strength,
             background_complexity=background_complexity,
             overexposure_prob=overexposure_prob,
+            blur_range=blur_range,
+            noise_std_range=noise_std_range,
+            brightness_range=brightness_range,
+            contrast_range=contrast_range,
+            motion_blur_prob=motion_blur_prob,
+            scintillation_prob=scintillation_prob,
+            occ_distribution=occ_distribution,
+            occluder_templates=occluder_templates,
         )
         _, _, meta = last_sample
         if desired_target_clamped is None or meta["target_clamped"] == desired_target_clamped:
@@ -1409,6 +1649,14 @@ def generate_dataset(args):
         "soft_focus_strength": args.soft_focus_strength,
         "background_complexity": args.background_complexity,
         "overexposure_prob": args.overexposure_prob,
+        "blur_range": [args.blur_min, args.blur_max],
+        "noise_std_range": [args.noise_std_min, args.noise_std_max],
+        "brightness_range": [args.brightness_min, args.brightness_max],
+        "contrast_range": [args.contrast_min, args.contrast_max],
+        "motion_blur_prob": args.motion_blur_prob,
+        "scintillation_prob": args.scintillation_prob,
+        "occ_distribution": args.occ_distribution,
+        "occluder_templates": args.occluder_templates,
         "seed": args.seed,
     }
 
@@ -1467,6 +1715,14 @@ def generate_dataset(args):
             soft_focus_strength=args.soft_focus_strength,
             background_complexity=args.background_complexity,
             overexposure_prob=args.overexposure_prob,
+            blur_range=(args.blur_min, args.blur_max),
+            noise_std_range=(args.noise_std_min, args.noise_std_max),
+            brightness_range=(args.brightness_min, args.brightness_max),
+            contrast_range=(args.contrast_min, args.contrast_max),
+            motion_blur_prob=args.motion_blur_prob,
+            scintillation_prob=args.scintillation_prob,
+            occ_distribution=args.occ_distribution,
+            occluder_templates=args.occluder_templates,
         )
 
         fname = f"{i:06d}"
@@ -1602,6 +1858,34 @@ def main():
     parser.add_argument("--overexposure_prob", type=float, default=0.0,
                         help="Probability of applying overexposure simulation (gamma compression + brightness boost) "
                              "per sample. Useful for training robustness against blown-out scenes. (default: 0.0)")
+    parser.add_argument("--blur_min", type=int, default=0,
+                        help="Min Gaussian blur kernel index (0 disables blur for that sample). Ignored when --degradation_preset=soft_focus.")
+    parser.add_argument("--blur_max", type=int, default=5,
+                        help="Max Gaussian blur kernel index. Ignored when --degradation_preset=soft_focus.")
+    parser.add_argument("--noise_std_min", type=float, default=0.0,
+                        help="Min Gaussian sensor-noise std. Ignored when --degradation_preset=soft_focus.")
+    parser.add_argument("--noise_std_max", type=float, default=25.0,
+                        help="Max Gaussian sensor-noise std. Ignored when --degradation_preset=soft_focus.")
+    parser.add_argument("--brightness_min", type=float, default=-40.0,
+                        help="Min brightness offset added per sample. Ignored when --degradation_preset=soft_focus.")
+    parser.add_argument("--brightness_max", type=float, default=40.0,
+                        help="Max brightness offset added per sample. Ignored when --degradation_preset=soft_focus.")
+    parser.add_argument("--contrast_min", type=float, default=0.6,
+                        help="Min contrast multiplier. Ignored when --degradation_preset=soft_focus.")
+    parser.add_argument("--contrast_max", type=float, default=1.4,
+                        help="Max contrast multiplier. Ignored when --degradation_preset=soft_focus.")
+    parser.add_argument("--motion_blur_prob", type=float, default=0.2,
+                        help="Probability of applying motion blur per sample. Ignored when --degradation_preset=soft_focus.")
+    parser.add_argument("--scintillation_prob", type=float, default=0.15,
+                        help="Probability of applying atmospheric scintillation warp per sample. "
+                             "Ignored when --degradation_preset=soft_focus.")
+    parser.add_argument("--occ_distribution", type=str, default="uniform",
+                        choices=["uniform", "beta_high", "beta_low"],
+                        help="Sampling distribution for target occlusion ratio inside [occ_min, occ_max]. "
+                             "'beta_high' clusters near occ_max, 'beta_low' clusters near occ_min.")
+    parser.add_argument("--occluder_templates", type=str, default="auto",
+                        help="Comma-separated subset of {single,stack_v,stack_h,scatter,tshape,lshape,cross,hshape,eshape} "
+                             "or 'auto' (default) to let the generator pick a template based on target_ratio.")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed for reproducibility")
     parser.add_argument("--visualize", action="store_true",

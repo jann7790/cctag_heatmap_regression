@@ -127,7 +127,13 @@ generate_one "base_clean" \
   --marker_max 333 \
   --occ_min 0.0 \
   --occ_max 0.0 \
-  --soft_focus_strength 0.20 \
+  --soft_focus_strength 0.15 \
+  --blur_min 0 --blur_max 2 \
+  --noise_std_min 0 --noise_std_max 6 \
+  --brightness_min -10 --brightness_max 10 \
+  --contrast_min 0.85 --contrast_max 1.15 \
+  --motion_blur_prob 0.05 \
+  --scintillation_prob 0.05 \
   "${common_args[@]}"
 
 generate_one "base_low_occ" \
@@ -139,6 +145,12 @@ generate_one "base_low_occ" \
   --occ_min 0.05 \
   --occ_max 0.50 \
   --soft_focus_strength 0.25 \
+  --blur_min 0 --blur_max 3 \
+  --noise_std_min 0 --noise_std_max 12 \
+  --brightness_min -25 --brightness_max 25 \
+  --contrast_min 0.75 --contrast_max 1.25 \
+  --motion_blur_prob 0.10 \
+  --scintillation_prob 0.10 \
   "${common_args[@]}"
 
 echo "==> merging base_set"
@@ -152,7 +164,13 @@ generate_one "hard_set" \
   --marker_max 333 \
   --occ_min 0.50 \
   --occ_max 0.85 \
-  --soft_focus_strength 0.70 \
+  --soft_focus_strength 0.55 \
+  --blur_min 1 --blur_max 5 \
+  --noise_std_min 4 --noise_std_max 20 \
+  --brightness_min -45 --brightness_max 45 \
+  --contrast_min 0.55 --contrast_max 1.45 \
+  --motion_blur_prob 0.30 \
+  --scintillation_prob 0.25 \
   "${common_args[@]}"
 
 generate_one "extreme_set" \
@@ -161,9 +179,16 @@ generate_one "extreme_set" \
   --seed 45 \
   --marker_min 66 \
   --marker_max 333 \
-  --occ_min 0.90 \
+  --occ_min 0.85 \
   --occ_max 1.00 \
-  --soft_focus_strength 0.90 \
+  --occ_distribution beta_high \
+  --soft_focus_strength 0.85 \
+  --blur_min 2 --blur_max 7 \
+  --noise_std_min 8 --noise_std_max 32 \
+  --brightness_min -65 --brightness_max 60 \
+  --contrast_min 0.40 --contrast_max 1.55 \
+  --motion_blur_prob 0.55 \
+  --scintillation_prob 0.45 \
   "${common_args[@]}"
 
 generate_one "small_set" \
