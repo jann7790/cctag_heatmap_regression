@@ -147,6 +147,9 @@ def parse_args() -> argparse.Namespace:
                         help="Add a 2-channel offset regression head (CenterNet-style) for sub-pixel center decoding.")
     parser.add_argument("--offset_weight", type=float, default=1.0,
                         help="Weight of the offset L1 loss term. Default: 1.0.")
+    parser.add_argument("--resume_from", type=Path, default=None,
+                        help="Path to a checkpoint (.pt). Loads model weights into the new run; "
+                             "optimizer/scheduler/epoch counter start fresh.")
     return parser.parse_args()
 
 
@@ -1211,6 +1214,14 @@ def main() -> None:
 
     model = build_model(heatmap_size=heatmap_size, device=device, rank=rank, world_size=world_size,
                         backbone=args.backbone, use_offset_head=args.offset_head)
+    if args.resume_from is not None:
+        ckpt = torch.load(args.resume_from, map_location=device, weights_only=False)
+        state_dict = ckpt["model_state_dict"] if isinstance(ckpt, dict) and "model_state_dict" in ckpt else ckpt
+        target = model.module if isinstance(model, DistributedDataParallel) else model
+        missing, unexpected = target.load_state_dict(state_dict, strict=False)
+        if is_main_process():
+            print(f"[resume] loaded weights from {args.resume_from} "
+                  f"(missing={len(missing)}, unexpected={len(unexpected)})")
     criterion = CombinedHeatmapLoss(
         use_focal=args.focal_loss,
         focal_alpha=args.focal_alpha,

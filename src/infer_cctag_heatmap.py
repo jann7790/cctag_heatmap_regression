@@ -739,6 +739,8 @@ def main() -> None:
 
     use_amp = args.amp and device.type == "cuda"
 
+    detection_log: list[dict[str, Any]] = []
+
     def _process_single(img_path: Path, heatmap: np.ndarray, heatmap_tensor: torch.Tensor,
                         offset: np.ndarray | None = None) -> None:
         """Post-process a single image: print result, save outputs, evaluate."""
@@ -770,6 +772,13 @@ def main() -> None:
         cx_px, cy_px = 0.0, 0.0
         if result is None:
             print(f"{img_path.name}  NO DETECTION  peak={peak_val:.3f} (< {args.threshold})")
+            detection_log.append({
+                "filename": img_path.name,
+                "detected": False,
+                "peak": peak_val,
+                "center_x_px": None,
+                "center_y_px": None,
+            })
         else:
             cx_hm, cy_hm = result
             hm_h, hm_w = heatmap.shape
@@ -778,10 +787,16 @@ def main() -> None:
             cy_px = cy_hm * orig_h / hm_h
             sharpness_str = f"  sharpness={sharpness:.2f}" if args.min_peak_sharpness > 0 else ""
             print(f"{img_path.name}  center=({cx_px:.1f}, {cy_px:.1f})px  heatmap_peak=({cx_hm:.1f}, {cy_hm:.1f})  peak={peak_val:.3f}{sharpness_str}")
+            detection_log.append({
+                "filename": img_path.name,
+                "detected": True,
+                "peak": peak_val,
+                "center_x_px": cx_px,
+                "center_y_px": cy_px,
+            })
 
         if args.output:
             stem = img_path.stem
-            np.save(args.output / f"{stem}_heatmap.npy", heatmap)
             if args.vis and result is not None:
                 save_overlay(img_path, heatmap, result, args.output / f"{stem}_overlay.png")
 
@@ -896,6 +911,30 @@ def main() -> None:
         print("  (AMP float16 enabled)")
     if args.compile:
         print("  (torch.compile enabled — first-run overhead included)")
+
+    # ── Detection summary (always printed) ────────────────────────────────────
+    detected = [d for d in detection_log if d["detected"]]
+    not_detected = [d for d in detection_log if not d["detected"]]
+    total = len(detection_log)
+    print("\n=== detection summary ===")
+    print(f"total images:   {total}")
+    print(f"detected:       {len(detected)}  ({len(detected)/total*100:.1f}%)" if total else "detected: 0")
+    print(f"not detected:   {len(not_detected)}  ({len(not_detected)/total*100:.1f}%)" if total else "not detected: 0")
+
+    if args.output:
+        args.output.mkdir(parents=True, exist_ok=True)
+        detected_path = args.output / "detected_images.txt"
+        not_detected_path = args.output / "not_detected_images.txt"
+        detection_csv = args.output / "detection_log.csv"
+        detected_path.write_text("\n".join(d["filename"] for d in detected) + "\n", encoding="utf-8")
+        not_detected_path.write_text("\n".join(d["filename"] for d in not_detected) + "\n", encoding="utf-8")
+        with detection_csv.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=["filename", "detected", "peak", "center_x_px", "center_y_px"])
+            writer.writeheader()
+            writer.writerows(detection_log)
+        print(f"saved detected list:     {detected_path}")
+        print(f"saved not-detected list: {not_detected_path}")
+        print(f"saved detection log:     {detection_csv}")
 
     if gt_map is not None:
         summarize_evaluation(eval_rows, args.output)

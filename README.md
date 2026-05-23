@@ -74,8 +74,11 @@ pip freeze > requirements.txt
 ```
 
 現在比較建議：
-
 ```bash
+
+unset UV_INDEX_URL
+
+export UV_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
 uv sync --extra cu126
 ```
 

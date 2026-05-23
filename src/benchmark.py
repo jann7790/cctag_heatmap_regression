@@ -93,6 +93,8 @@ def parse_args() -> argparse.Namespace:
                    help="Single image to use for latency measurement (default: first image found)")
     p.add_argument("--cpu_latency_runs", type=int, default=30,
                    help="Number of timed iterations for CPU latency (slower)")
+    p.add_argument("--no_latency", action="store_true",
+                   help="Skip all latency/throughput measurements; run accuracy evaluation only")
     p.add_argument("--skip_existing", action="store_true",
                    help="Skip models whose model_summary.json already exists and suites "
                         "whose evaluation_summary.json already exists")
@@ -509,12 +511,43 @@ def evaluate_suite(
 
 # ── discover suites ───────────────────────────────────────────────────────────
 
+def _is_suite_dir(path: Path) -> bool:
+    """Check whether a directory looks like a test suite."""
+    return ((path / "images").is_dir()
+            and (path / "labels.csv").is_file()
+            and (path / "heatmaps").is_dir())
+
+
+def _resolve_suites(suites_dir: Path, suite_specs: list[str] | None) -> list[Path]:
+    """Resolve suite specs to a flat list of suite directories.
+
+    Each spec can be:
+    - A direct suite directory (has images/, labels.csv/, heatmaps/)
+    - A directory containing suites (auto-discovered recursively)
+    - A name relative to suites_dir
+    """
+    if not suite_specs:
+        return discover_suites(suites_dir)
+
+    result: list[Path] = []
+    for spec in suite_specs:
+        p = Path(spec)
+        candidate = p if p.exists() else suites_dir / spec
+        if _is_suite_dir(candidate):
+            result.append(candidate)
+        elif candidate.is_dir():
+            result.extend(discover_suites(candidate))
+        else:
+            raise SystemExit(f"Suite spec '{spec}' does not resolve to a directory: {candidate}")
+    return result
+
+
 def discover_suites(suites_dir: Path) -> list[Path]:
     """Find all directories under suites_dir that contain images/ and labels.csv."""
     found = []
     for candidate in sorted(suites_dir.rglob("images")):
         parent = candidate.parent
-        if (parent / "labels.csv").is_file() and (parent / "heatmaps").is_dir():
+        if _is_suite_dir(parent):
             found.append(parent)
     return found
 
@@ -571,10 +604,7 @@ def main() -> None:
         raise SystemExit(f"No model runs found in {args.runs_dir}")
 
     # ── discover test suites ─────────────────────────────────────────────────
-    if args.suites:
-        suite_dirs = [args.suites_dir / s for s in args.suites]
-    else:
-        suite_dirs = discover_suites(args.suites_dir)
+    suite_dirs = _resolve_suites(args.suites_dir, args.suites)
 
     if not suite_dirs:
         raise SystemExit(f"No evaluable suites found under {args.suites_dir}")
@@ -587,16 +617,17 @@ def main() -> None:
 
     # ── pick latency sample image ────────────────────────────────────────────
     latency_image_path = args.latency_image
-    if latency_image_path is None:
-        for suite in suite_dirs:
-            imgs = sorted((suite / "images").glob("*"))
-            candidates = [p for p in imgs if p.suffix.lower() in IMAGE_EXTS]
-            if candidates:
-                latency_image_path = candidates[0]
-                break
-    if latency_image_path is None:
-        raise SystemExit("Could not find any image for latency measurement")
-    print(f"Latency probe image: {latency_image_path}\n")
+    if not args.no_latency:
+        if latency_image_path is None:
+            for suite in suite_dirs:
+                imgs = sorted((suite / "images").glob("*"))
+                candidates = [p for p in imgs if p.suffix.lower() in IMAGE_EXTS]
+                if candidates:
+                    latency_image_path = candidates[0]
+                    break
+        if latency_image_path is None:
+            raise SystemExit("Could not find any image for latency measurement")
+        print(f"Latency probe image: {latency_image_path}\n")
 
     all_results: dict[str, Any] = {}
 
@@ -607,26 +638,12 @@ def main() -> None:
         print(f"MODEL: {model_name}")
         print(f"{'='*60}")
 
-        # ── latency: use cache or measure ────────────────────────────────────
+        # ── latency: skip / use cache / measure ──────────────────────────────
         model_json = args.output / model_name / "model_summary.json"
         _LATENCY_SENTINEL = "gpu_baseline_mean_ms"  # absent in old-format caches
 
-        _use_latency_cache = (
-            args.skip_existing
-            and model_json.is_file()
-            and _LATENCY_SENTINEL in json.loads(model_json.read_text(encoding="utf-8"))
-        )
-
-        if _use_latency_cache:
-            cached = json.loads(model_json.read_text(encoding="utf-8"))
-            latency_results = {k: v for k, v in cached.items()
-                               if k not in ("model", "backbone", "checkpoint", "suites")}
-            backbone = cached.get("backbone", "?")
-            config: dict = {}
-            model = None
-            print(f"  backbone={backbone}  [latency cached]")
-        else:
-            # ── load model ───────────────────────────────────────────────────
+        if args.no_latency:
+            latency_results: dict = {}
             device = gpu_device if cuda_available else cpu_device
             try:
                 model, config = load_model(checkpoint, device)
@@ -636,27 +653,56 @@ def main() -> None:
             backbone = config.get("backbone", "efficientnet_b0")
             input_w  = config.get("input_width", 640)
             input_h  = config.get("input_height", 400)
-            print(f"  backbone={backbone}  input={input_w}x{input_h}  "
-                  f"warmup={args.warmup}  runs={args.latency_runs}")
-
-            # ── measure all latency variants ─────────────────────────────────
+            print(f"  backbone={backbone}  input={input_w}x{input_h}  [latency skipped]")
             if cuda_available:
-                latency_results, model = measure_all_latency(
-                    model, latency_image_path, config,
-                    gpu_device, cpu_device,
-                    warmup=args.warmup,
-                    runs=args.latency_runs,
-                    cpu_runs=args.cpu_latency_runs,
-                    throughput_batch_size=args.throughput_batch_size,
-                    use_inference_mode=not args.no_inference_mode,
-                    decode_method=args.decode_method,
-                )
+                model = model.to(gpu_device)
+        else:
+            _use_latency_cache = (
+                args.skip_existing
+                and model_json.is_file()
+                and _LATENCY_SENTINEL in json.loads(model_json.read_text(encoding="utf-8"))
+            )
+
+            if _use_latency_cache:
+                cached = json.loads(model_json.read_text(encoding="utf-8"))
+                latency_results = {k: v for k, v in cached.items()
+                                   if k not in ("model", "backbone", "checkpoint", "suites")}
+                backbone = cached.get("backbone", "?")
+                config: dict = {}
+                model = None
+                print(f"  backbone={backbone}  [latency cached]")
             else:
-                model_cpu = model.cpu().eval()
-                cpu_x, _ = preprocess(latency_image_path, input_w, input_h, cpu_device)
-                t = _cpu_timed_runs(model_cpu, cpu_x, min(args.warmup, 5), args.cpu_latency_runs)
-                latency_results = _latency_stats(t, "cpu_baseline")
-                model = model_cpu
+                # ── load model ───────────────────────────────────────────────────
+                device = gpu_device if cuda_available else cpu_device
+                try:
+                    model, config = load_model(checkpoint, device)
+                except Exception as exc:
+                    print(f"  [SKIP] failed to load checkpoint: {exc}")
+                    continue
+                backbone = config.get("backbone", "efficientnet_b0")
+                input_w  = config.get("input_width", 640)
+                input_h  = config.get("input_height", 400)
+                print(f"  backbone={backbone}  input={input_w}x{input_h}  "
+                      f"warmup={args.warmup}  runs={args.latency_runs}")
+
+                # ── measure all latency variants ─────────────────────────────────
+                if cuda_available:
+                    latency_results, model = measure_all_latency(
+                        model, latency_image_path, config,
+                        gpu_device, cpu_device,
+                        warmup=args.warmup,
+                        runs=args.latency_runs,
+                        cpu_runs=args.cpu_latency_runs,
+                        throughput_batch_size=args.throughput_batch_size,
+                        use_inference_mode=not args.no_inference_mode,
+                        decode_method=args.decode_method,
+                    )
+                else:
+                    model_cpu = model.cpu().eval()
+                    cpu_x, _ = preprocess(latency_image_path, input_w, input_h, cpu_device)
+                    t = _cpu_timed_runs(model_cpu, cpu_x, min(args.warmup, 5), args.cpu_latency_runs)
+                    latency_results = _latency_stats(t, "cpu_baseline")
+                    model = model_cpu
 
         # ── accuracy evaluation per suite ────────────────────────────────────
         # load cached suite results if skip_existing
@@ -738,41 +784,42 @@ def main() -> None:
         v = res.get(key)
         return f"{v:{fmt}}" if v is not None else "n/a"
 
-    print(f"\n{'='*80}")
-    print("GPU LATENCY (bs=1, CUDA events)  —  forward pass only")
-    print(f"{'='*80}")
-    print_table(
-        ["model", "baseline_ms", "AMP_ms", "compile_ms", "compile+AMP_ms", "pipeline_ms", "pipeline_fps"],
-        [[mn,
-          _g(r, "gpu_baseline_mean_ms"),
-          _g(r, "gpu_amp_mean_ms"),
-          _g(r, "gpu_compile_mean_ms"),
-          _g(r, "gpu_compile_amp_mean_ms"),
-          _g(r, "gpu_pipeline_mean_ms"),
-          f"{1000/r['gpu_pipeline_mean_ms']:.1f}" if r.get("gpu_pipeline_mean_ms") else "n/a",
-         ] for mn, r in all_results.items()],
-        col_width=18,
-    )
+    if not args.no_latency:
+        print(f"\n{'='*80}")
+        print("GPU LATENCY (bs=1, CUDA events)  —  forward pass only")
+        print(f"{'='*80}")
+        print_table(
+            ["model", "baseline_ms", "AMP_ms", "compile_ms", "compile+AMP_ms", "pipeline_ms", "pipeline_fps"],
+            [[mn,
+              _g(r, "gpu_baseline_mean_ms"),
+              _g(r, "gpu_amp_mean_ms"),
+              _g(r, "gpu_compile_mean_ms"),
+              _g(r, "gpu_compile_amp_mean_ms"),
+              _g(r, "gpu_pipeline_mean_ms"),
+              f"{1000/r['gpu_pipeline_mean_ms']:.1f}" if r.get("gpu_pipeline_mean_ms") else "n/a",
+             ] for mn, r in all_results.items()],
+            col_width=18,
+        )
 
-    print(f"\n{'='*80}")
-    print("GPU THROUGHPUT (bs=16, wall-clock FPS)")
-    print(f"{'='*80}")
-    print_table(
-        ["model", "baseline_fps", "compile_fps"],
-        [[mn, _g(r, "gpu_tput_baseline_fps", ".0f"), _g(r, "gpu_tput_compile_fps", ".0f")]
-         for mn, r in all_results.items()],
-        col_width=22,
-    )
+        print(f"\n{'='*80}")
+        print("GPU THROUGHPUT (bs=16, wall-clock FPS)")
+        print(f"{'='*80}")
+        print_table(
+            ["model", "baseline_fps", "compile_fps"],
+            [[mn, _g(r, "gpu_tput_baseline_fps", ".0f"), _g(r, "gpu_tput_compile_fps", ".0f")]
+             for mn, r in all_results.items()],
+            col_width=22,
+        )
 
-    print(f"\n{'='*80}")
-    print("CPU LATENCY (bs=1, wall-clock)")
-    print(f"{'='*80}")
-    print_table(
-        ["model", "baseline_ms", "compile_ms"],
-        [[mn, _g(r, "cpu_baseline_mean_ms", ".1f"), _g(r, "cpu_compile_mean_ms", ".1f")]
-         for mn, r in all_results.items()],
-        col_width=22,
-    )
+        print(f"\n{'='*80}")
+        print("CPU LATENCY (bs=1, wall-clock)")
+        print(f"{'='*80}")
+        print_table(
+            ["model", "baseline_ms", "compile_ms"],
+            [[mn, _g(r, "cpu_baseline_mean_ms", ".1f"), _g(r, "cpu_compile_mean_ms", ".1f")]
+             for mn, r in all_results.items()],
+            col_width=22,
+        )
 
     print(f"\n{'='*60}")
     print("DETECTION F1 BY SUITE")
