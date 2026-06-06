@@ -22,6 +22,12 @@ cu126 = [
     "torch==2.11.0+cu126",
     "torchvision==0.26.0+cu126",
 ]
+# Detection (acquisition) stage: YOLO-nano via ultralytics. Isolated extra so it
+# coexists with either the cpu or cu126 torch extra. Install alongside one of them:
+#   uv sync --extra cu126 --extra detect
+detect = [
+    "ultralytics>=8.3.0",
+]
 
 [dependency-groups]
 dev = []

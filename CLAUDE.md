@@ -66,7 +66,7 @@ Shell scripts in `scripts/` orchestrate multi-step workflows (generating trainin
 ## Dataset Output Contract
 
 Generated datasets contain:
-- `images/` (PNG), `heatmaps/` (NPY), `labels_yolo/` (TXT)
+- `images/` (PNG), `heatmaps/` (compressed NPZ, float16, key `heatmap`; legacy `.npy` still readable), `labels_yolo/` (TXT)
 - `labels.csv` with 23 columns (coordinates, ellipse geometry, occlusion, YOLO format, negative flags, visibility)
 - `config.json` with generation parameters
 

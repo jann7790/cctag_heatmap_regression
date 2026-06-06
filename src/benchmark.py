@@ -43,8 +43,10 @@ from infer_cctag_heatmap import (
     decode_center_offset,
     decode_center_subpixel,
     decode_center_weighted,
+    decode_size_at_peak,
     infer_dataset_dir,
     load_ground_truth_map,
+    load_heatmap,
     load_model,
     preprocess,
     resize_heatmap_to_shape,
@@ -54,10 +56,16 @@ from infer_cctag_heatmap import (
 
 
 def _split_pred(out):
-    """Return (heatmap_tensor, offset_tensor_or_None)."""
-    if isinstance(out, tuple):
-        return out[0], out[1]
-    return out, None
+    """Return (heatmap, offset_or_None, size_or_None).
+
+    Accepts a bare heatmap tensor, a legacy 2-tuple (heatmap, offset),
+    or the current 3-tuple (heatmap, offset_or_None, size_or_None).
+    """
+    if not isinstance(out, tuple):
+        return out, None, None
+    if len(out) == 2:
+        return out[0], out[1], None
+    return out[0], out[1], out[2]
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
@@ -192,6 +200,30 @@ def _gpu_throughput_fps(model: nn.Module, x: torch.Tensor, batch_size: int,
 _COMPILE_WARMUP_EXTRA = 10
 
 
+def _try_compile(model: nn.Module) -> nn.Module | None:
+    """Wrap ``model`` with ``torch.compile``, returning None if unavailable.
+
+    ``torch.compile`` is lazy: the actual inductor compilation runs on the first
+    forward pass, so most failures surface in the timed runs rather than here.
+    Callers must therefore also guard the warmup/timed calls. We additionally
+    disable dynamo's AOT repro dump, whose ``nvcc --version`` probe can itself
+    raise (e.g. PermissionError) and mask the original compile error.
+    """
+    compile_fn = getattr(torch, "compile", None)
+    if compile_fn is None:
+        return None
+    try:
+        # Avoid the repro-on-failure path that shells out to `nvcc`.
+        torch._dynamo.config.repro_after = None  # type: ignore[attr-defined]
+    except Exception:
+        pass
+    try:
+        return compile_fn(model)
+    except Exception as e:
+        print(f" (torch.compile failed: {type(e).__name__}: {e})", end="")
+        return None
+
+
 def _decode_center_by_method(heatmap: np.ndarray, threshold: float, method: str) -> tuple[float, float] | None:
     if method == "weighted":
         return decode_center_weighted(heatmap, threshold=threshold)
@@ -256,24 +288,36 @@ def measure_all_latency(
     print(f"mean={results['gpu_amp_mean_ms']:.2f}ms  p99={results['gpu_amp_p99_ms']:.2f}ms")
 
     print(f"  [gpu compile]       compiling...", end="", flush=True)
-    model_gpu_compiled = torch.compile(model_gpu)
-    _gpu_timed_runs(model_gpu_compiled, gpu_x, warmup + _COMPILE_WARMUP_EXTRA, runs, use_amp=False, use_inference_mode=use_inference_mode)
-    t = _gpu_timed_runs(model_gpu_compiled, gpu_x, 0, runs, use_amp=False, use_inference_mode=use_inference_mode)
-    results.update(_latency_stats(t, "gpu_compile"))
-    print(f"\r  [gpu compile]       mean={results['gpu_compile_mean_ms']:.2f}ms  p99={results['gpu_compile_p99_ms']:.2f}ms")
+    model_gpu_compiled = _try_compile(model_gpu)
+    if model_gpu_compiled is not None:
+        try:
+            _gpu_timed_runs(model_gpu_compiled, gpu_x, warmup + _COMPILE_WARMUP_EXTRA, runs, use_amp=False, use_inference_mode=use_inference_mode)
+            t = _gpu_timed_runs(model_gpu_compiled, gpu_x, 0, runs, use_amp=False, use_inference_mode=use_inference_mode)
+            results.update(_latency_stats(t, "gpu_compile"))
+            print(f"\r  [gpu compile]       mean={results['gpu_compile_mean_ms']:.2f}ms  p99={results['gpu_compile_p99_ms']:.2f}ms")
+        except Exception as e:
+            model_gpu_compiled = None
+            print(f"\r  [gpu compile]       SKIPPED (run failed: {type(e).__name__}: {e})")
+    else:
+        print(f"\r  [gpu compile]       SKIPPED (torch.compile unavailable)")
 
-    print(f"  [gpu compile+AMP]   ", end="", flush=True)
-    t = _gpu_timed_runs(model_gpu_compiled, gpu_x, warmup, runs, use_amp=True, use_inference_mode=use_inference_mode)
-    results.update(_latency_stats(t, "gpu_compile_amp"))
-    print(f"mean={results['gpu_compile_amp_mean_ms']:.2f}ms  p99={results['gpu_compile_amp_p99_ms']:.2f}ms")
+    if model_gpu_compiled is not None:
+        print(f"  [gpu compile+AMP]   ", end="", flush=True)
+        t = _gpu_timed_runs(model_gpu_compiled, gpu_x, warmup, runs, use_amp=True, use_inference_mode=use_inference_mode)
+        results.update(_latency_stats(t, "gpu_compile_amp"))
+        print(f"mean={results['gpu_compile_amp_mean_ms']:.2f}ms  p99={results['gpu_compile_amp_p99_ms']:.2f}ms")
 
     print(f"  [gpu throughput bs={throughput_batch_size}] baseline...", end="", flush=True)
     results["gpu_tput_baseline_fps"] = _gpu_throughput_fps(
         model_gpu, gpu_x, throughput_batch_size, warmup, runs, use_amp=False, use_inference_mode=use_inference_mode)
-    print(f" {results['gpu_tput_baseline_fps']:.0f} FPS  |  compile...", end="", flush=True)
-    results["gpu_tput_compile_fps"] = _gpu_throughput_fps(
-        model_gpu_compiled, gpu_x, throughput_batch_size, warmup, runs, use_amp=False, use_inference_mode=use_inference_mode)
-    print(f" {results['gpu_tput_compile_fps']:.0f} FPS")
+    print(f" {results['gpu_tput_baseline_fps']:.0f} FPS", end="", flush=True)
+    if model_gpu_compiled is not None:
+        print(f"  |  compile...", end="", flush=True)
+        results["gpu_tput_compile_fps"] = _gpu_throughput_fps(
+            model_gpu_compiled, gpu_x, throughput_batch_size, warmup, runs, use_amp=False, use_inference_mode=use_inference_mode)
+        print(f" {results['gpu_tput_compile_fps']:.0f} FPS")
+    else:
+        print()
 
     # ── CPU variants ──────────────────────────────────────────────────────────
     cpu_warmup = min(warmup, 5)
@@ -286,11 +330,17 @@ def measure_all_latency(
     print(f"mean={results['cpu_baseline_mean_ms']:.1f}ms  p99={results['cpu_baseline_p99_ms']:.1f}ms")
 
     print(f"  [cpu compile]       compiling...", end="", flush=True)
-    model_cpu_compiled = torch.compile(model_cpu)
-    _cpu_timed_runs(model_cpu_compiled, cpu_x, cpu_warmup + _COMPILE_WARMUP_EXTRA, cpu_runs, use_inference_mode=use_inference_mode)
-    t = _cpu_timed_runs(model_cpu_compiled, cpu_x, 0, cpu_runs, use_inference_mode=use_inference_mode)
-    results.update(_latency_stats(t, "cpu_compile"))
-    print(f"\r  [cpu compile]       mean={results['cpu_compile_mean_ms']:.1f}ms  p99={results['cpu_compile_p99_ms']:.1f}ms")
+    model_cpu_compiled = _try_compile(model_cpu)
+    if model_cpu_compiled is not None:
+        try:
+            _cpu_timed_runs(model_cpu_compiled, cpu_x, cpu_warmup + _COMPILE_WARMUP_EXTRA, cpu_runs, use_inference_mode=use_inference_mode)
+            t = _cpu_timed_runs(model_cpu_compiled, cpu_x, 0, cpu_runs, use_inference_mode=use_inference_mode)
+            results.update(_latency_stats(t, "cpu_compile"))
+            print(f"\r  [cpu compile]       mean={results['cpu_compile_mean_ms']:.1f}ms  p99={results['cpu_compile_p99_ms']:.1f}ms")
+        except Exception as e:
+            print(f"\r  [cpu compile]       SKIPPED (run failed: {type(e).__name__}: {e})")
+    else:
+        print(f"\r  [cpu compile]       SKIPPED (torch.compile unavailable)")
 
     # ── Full pipeline (most relevant for real-time camera) ───────────────────
     # Measures: read+preprocess (CPU) → H2D copy → forward → D2H → peak decode
@@ -301,7 +351,7 @@ def measure_all_latency(
         for _ in range(warmup):
             _t, _ = preprocess(probe_image_path, input_w, input_h, cpu_device)
             _t = _t.to(gpu_device)
-            _hm, _off = _split_pred(model_gpu(_t))
+            _hm, _off, _ = _split_pred(model_gpu(_t))
             torch.cuda.synchronize()
             if _off is not None:
                 decode_center_offset(_hm[0, 0].detach().cpu().numpy(), _off[0].detach().cpu().numpy(), 0.5)
@@ -312,7 +362,7 @@ def measure_all_latency(
             t0 = time.perf_counter()
             _t, _ = preprocess(probe_image_path, input_w, input_h, cpu_device)
             _t = _t.to(gpu_device)
-            _hm, _off = _split_pred(model_gpu(_t))
+            _hm, _off, _ = _split_pred(model_gpu(_t))
             torch.cuda.synchronize()
             if _off is not None:
                 decode_center_offset(_hm[0, 0].detach().cpu().numpy(), _off[0].detach().cpu().numpy(), 0.5)
@@ -371,7 +421,7 @@ def evaluate_suite(
                 tensors.append(t)
                 orig_sizes[p] = orig
             batch_input = torch.cat(tensors, dim=0)
-            batch_hm, batch_off = _split_pred(model(batch_input))
+            batch_hm, batch_off, batch_size = _split_pred(model(batch_input))
 
             for i, img_path in enumerate(batch_paths):
                 heatmap_tensor = batch_hm[i: i + 1].float()
@@ -383,6 +433,10 @@ def evaluate_suite(
                     result = decode_center_offset(heatmap, offset_np, threshold=args.threshold)
                 else:
                     result = _decode_center_by_method(heatmap, args.threshold, args.decode_method)
+                size_ab: tuple[float, float] | None = None
+                if batch_size is not None:
+                    size_log_np = batch_size[i].float().detach().cpu().numpy()
+                    size_ab = decode_size_at_peak(heatmap, size_log_np, threshold=args.threshold)
 
                 # Apply sharpness filter: reject detections with low sharpness
                 sharpness_rejected = False
@@ -400,7 +454,7 @@ def evaluate_suite(
                 if not gt_heatmap_path.is_file():
                     continue
 
-                gt_heatmap_raw = np.load(gt_heatmap_path).astype(np.float32)
+                gt_heatmap_raw = load_heatmap(gt_heatmap_path)
                 gt_heatmap = resize_heatmap_to_shape(gt_heatmap_raw, heatmap.shape)
                 gt_tensor = torch.from_numpy(gt_heatmap[None, None]).to(device)
 
@@ -432,6 +486,23 @@ def evaluate_suite(
                     cy_px = result[1] * orig_h_ / hm_h
                     center_l2 = float(np.hypot(cx_px - gt_row["center_x"], cy_px - gt_row["center_y"]))
 
+                # Size head metrics: compare exp(size_log) at peak vs GT ellipse_a/b.
+                # Defined only when size head is present, GT is positive, and we detected.
+                size_log_mae: float | None = None
+                size_rel_err: float | None = None
+                ellipse_a_pred: float | None = None
+                ellipse_b_pred: float | None = None
+                gt_a = float(gt_row.get("ellipse_a") or 0.0)
+                gt_b = float(gt_row.get("ellipse_b") or 0.0)
+                if size_ab is not None and gt_has and pred_has and gt_a > 0.0 and gt_b > 0.0:
+                    ellipse_a_pred, ellipse_b_pred = size_ab
+                    log_a_err = abs(float(np.log(ellipse_a_pred)) - float(np.log(gt_a)))
+                    log_b_err = abs(float(np.log(ellipse_b_pred)) - float(np.log(gt_b)))
+                    size_log_mae = 0.5 * (log_a_err + log_b_err)
+                    rel_a = abs(ellipse_a_pred - gt_a) / gt_a
+                    rel_b = abs(ellipse_b_pred - gt_b) / gt_b
+                    size_rel_err = 0.5 * (rel_a + rel_b)
+
                 eval_rows.append({
                     "filename": stem,
                     "peak": peak_val,
@@ -443,6 +514,12 @@ def evaluate_suite(
                     "bce_loss": bce_loss,
                     "dice_loss": dice_loss,
                     "center_l2_px": center_l2,
+                    "ellipse_a_pred": ellipse_a_pred,
+                    "ellipse_b_pred": ellipse_b_pred,
+                    "ellipse_a_gt": gt_a if gt_a > 0.0 else None,
+                    "ellipse_b_gt": gt_b if gt_b > 0.0 else None,
+                    "size_log_mae": size_log_mae,
+                    "size_rel_err": size_rel_err,
                     "tp_pixels": tp_px, "fp_pixels": fp_px,
                     "fn_pixels": fn_px, "tn_pixels": tn_px,
                     "tp_det": tp_det, "fp_det": fp_det,
@@ -475,6 +552,8 @@ def evaluate_suite(
     det_acc  = safe_divide(tp_d + tn_d, tp_d + tn_d + fp_d + fn_d)
 
     center_errors = [r["center_l2_px"] for r in eval_rows if r["center_l2_px"] is not None]
+    size_log_errors = [r["size_log_mae"] for r in eval_rows if r["size_log_mae"] is not None]
+    size_rel_errors = [r["size_rel_err"] for r in eval_rows if r["size_rel_err"] is not None]
 
     # Sharpness filtering stats
     sharpness_rejected_fp = sum(1 for r in eval_rows if r["sharpness_rejected"] and r["is_negative_gt"])
@@ -499,6 +578,11 @@ def evaluate_suite(
         "detection_recall": det_rec,
         "detection_f1": det_f1,
         "mean_center_l2_px": float(np.mean(center_errors)) if center_errors else None,
+        "size_log_mae_mean": float(np.mean(size_log_errors)) if size_log_errors else None,
+        "size_log_mae_median": float(np.median(size_log_errors)) if size_log_errors else None,
+        "size_rel_err_mean": float(np.mean(size_rel_errors)) if size_rel_errors else None,
+        "size_rel_err_median": float(np.median(size_rel_errors)) if size_rel_errors else None,
+        "size_evaluated_count": len(size_log_errors),
         "sharpness_rejected_total": sharpness_total_rejected,
         "sharpness_rejected_fp_blocked": sharpness_rejected_fp,
         "sharpness_rejected_tp_killed": sharpness_rejected_tp,
@@ -753,11 +837,15 @@ def main() -> None:
             if args.min_peak_sharpness > 0 and metrics["sharpness_rejected_total"] > 0:
                 sharp_info = (f"  sharp_filter=[blk_fp={metrics['sharpness_rejected_fp_blocked']}"
                               f" kill_tp={metrics['sharpness_rejected_tp_killed']}]")
+            size_info = ""
+            if metrics.get("size_evaluated_count", 0) > 0:
+                size_info = (f"  size_rel_err={metrics['size_rel_err_mean']:.3f}"
+                             f"  size_log_mae={metrics['size_log_mae_mean']:.3f}")
             print(f"det_f1={metrics['detection_f1']:.4f}  "
                   f"iou={metrics['heatmap_pixel_iou']:.4f}  "
-                  f"center_l2={metrics['mean_center_l2_px']:.2f}px{sharp_info}"
+                  f"center_l2={metrics['mean_center_l2_px']:.2f}px{sharp_info}{size_info}"
                   if metrics['mean_center_l2_px'] is not None else
-                  f"det_f1={metrics['detection_f1']:.4f}  iou={metrics['heatmap_pixel_iou']:.4f}{sharp_info}")
+                  f"det_f1={metrics['detection_f1']:.4f}  iou={metrics['heatmap_pixel_iou']:.4f}{sharp_info}{size_info}")
 
         model_result = {
             "model": model_name,
@@ -847,6 +935,32 @@ def main() -> None:
                         for mn in model_names]
                  for s in all_suites],
                 col_width=24)
+
+    # Size head tables: only shown when at least one model produced size metrics.
+    any_size = any(
+        (all_results[mn]["suites"].get(s, {}) or {}).get("size_evaluated_count", 0) > 0
+        for mn in model_names for s in all_suites
+    )
+    if any_size:
+        def _size_cell(mn: str, s: str, key: str) -> str:
+            v = (all_results[mn]["suites"].get(s, {}) or {}).get(key)
+            return f"{v:.3f}" if v is not None else "n/a"
+
+        print(f"\n{'='*60}")
+        print("SIZE RELATIVE ERROR (mean of |pred-gt|/gt over a,b) BY SUITE")
+        print(f"{'='*60}")
+        print_table(["suite"] + model_names,
+                    [[s] + [_size_cell(mn, s, "size_rel_err_mean") for mn in model_names]
+                     for s in all_suites],
+                    col_width=24)
+
+        print(f"\n{'='*60}")
+        print("SIZE LOG-MAE (mean of |log(pred)-log(gt)| over a,b) BY SUITE")
+        print(f"{'='*60}")
+        print_table(["suite"] + model_names,
+                    [[s] + [_size_cell(mn, s, "size_log_mae_mean") for mn in model_names]
+                     for s in all_suites],
+                    col_width=24)
 
     # ── Sharpness filter report ──────────────────────────────────────────────
     if args.min_peak_sharpness > 0:

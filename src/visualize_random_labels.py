@@ -11,6 +11,21 @@ import cv2
 import numpy as np
 
 
+def resolve_heatmap_path(directory: Path, stem: str) -> Path:
+    """Heatmap file for a stem, preferring compressed .npz over legacy .npy."""
+    npz = directory / f"{stem}.npz"
+    return npz if npz.exists() else directory / f"{stem}.npy"
+
+
+def load_heatmap(path: Path) -> np.ndarray:
+    """Load a heatmap stored as compressed .npz (key 'heatmap') or legacy .npy, as float32."""
+    path = Path(path)
+    if path.suffix == ".npz":
+        with np.load(path) as data:
+            return data["heatmap"].astype(np.float32)
+    return np.load(path).astype(np.float32)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Randomly sample images from a dataset and visualize center-point and ellipse labels."
@@ -210,8 +225,8 @@ def draw_labels(
     overlay = image.copy()
 
     if heatmap_path and heatmap_path.exists():
-        if heatmap_path.suffix == ".npy":
-            heatmap_raw = np.load(heatmap_path).astype(np.float32)
+        if heatmap_path.suffix in (".npy", ".npz"):
+            heatmap_raw = load_heatmap(heatmap_path)
             # Resize from strided shape to original image shape
             heatmap_resized = cv2.resize(
                 heatmap_raw, (w, h), interpolation=cv2.INTER_LINEAR
@@ -306,7 +321,7 @@ def main() -> None:
     for image_path in sampled_images:
         label_path = label_dir / f"{image_path.stem}.txt"
 
-        heatmap_path = heatmap_dir / f"{image_path.stem}.npy"
+        heatmap_path = resolve_heatmap_path(heatmap_dir, image_path.stem)
         if not heatmap_path.exists():
             heatmap_path = None
             for ext in [".png", ".jpg", ".jpeg"]:

@@ -2,6 +2,15 @@
 
 這個 repo 用來生成 CCTag 合成資料、檢查標註、訓練 heatmap regression 模型，並對模型做推論與評估。
 
+  uv run torchrun --nproc_per_node=1 --master_port=29501 src/train_cctag_heatmap_ddp.py \
+    --train_dataset_dir ./outputs/training_sets/generated_training_sets/mixed_train_dataset_train \
+    --train_dataset_dir /mnt/nvme2n1/r13922171/real_world_merged_640x400_train \
+    --val_dataset_dir   ./outputs/training_sets/generated_training_sets/mixed_train_dataset_val \
+    --val_dataset_dir   /mnt/nvme2n1/r13922171/real_world_merged_640x400_val \
+    --output_dir ./outputs/runs/experiment_sizehead \
+    --offset_head --size_head --focal_loss --batch_size 48
+
+    
 ## Repository Layout
 
 ```text
@@ -36,42 +45,6 @@
 - `requirements/*.txt`：保留給舊流程或純 `pip` 使用的相容檔。
 - `uv.lock`：鎖定實際解析出的完整依賴樹，讓不同機器重建出一致環境。
 
-### 如果你以前都用 requirements.txt
-
-可以先用這個心智模型理解：
-
-- `requirements.txt`：你手寫「想裝什麼」。
-- `pip freeze`：把「目前環境實際裝了什麼」全部列出來。
-- `pyproject.toml`：新版的主要依賴定義檔，比 `requirements.txt` 更完整。
-- `uv.lock`：比 `pip freeze` 更適合提交到 repo 的鎖檔。
-- `uv sync`：依照 `pyproject.toml` 和 `uv.lock` 建立一致環境。
-
-`pip freeze` 會輸出目前 virtualenv 內已安裝套件的精確版本，例如：
-
-```bash
-pip freeze
-```
-
-可能會得到：
-
-```text
-numpy==2.4.3
-opencv-python==4.13.0.92
-torch==2.11.0+cu126
-torchvision==0.26.0+cu126
-```
-
-但它有兩個限制：
-
-- 它描述的是「現在這個環境碰巧裝了什麼」，不一定是你真正想維護的最小依賴集合。
-- 它常會把很多間接依賴一起寫出來，久了會很難整理。
-
-以前常見流程是：
-
-```bash
-pip install -r requirements.txt
-pip freeze > requirements.txt
-```
 
 現在比較建議：
 ```bash

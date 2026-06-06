@@ -8,7 +8,7 @@ coordinates under 30-50% occlusion via Gaussian heatmap regression.
 Output structure:
   output_dir/
     images/       - input images (PNG)
-    heatmaps/     - ground truth heatmap (NPY, float32, single channel)
+    heatmaps/     - ground truth heatmap (compressed NPZ, float16, key 'heatmap')
     labels.csv    - center point, fitted ellipse, bbox, occlusion metadata per image
     config.json   - generation parameters for reproducibility
 
@@ -146,6 +146,20 @@ def validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> 
         parser.error("--motion_blur_prob must be between 0.0 and 1.0.")
     if not 0.0 <= args.scintillation_prob <= 1.0:
         parser.error("--scintillation_prob must be between 0.0 and 1.0.")
+    if not 0.0 <= args.low_light_prob <= 1.0:
+        parser.error("--low_light_prob must be between 0.0 and 1.0.")
+    if args.low_light_white_min > args.low_light_white_max:
+        parser.error("--low_light_white_min cannot exceed --low_light_white_max.")
+    if args.low_light_black_min > args.low_light_black_max:
+        parser.error("--low_light_black_min cannot exceed --low_light_black_max.")
+    if args.low_light_black_min < 0.0 or args.low_light_white_max > 255.0:
+        parser.error("low-light band must lie within [0, 255].")
+    if not 0.0 <= args.vignette_prob <= 1.0:
+        parser.error("--vignette_prob must be between 0.0 and 1.0.")
+    if not 0.0 <= args.vignette_strength_min <= 1.0 or not 0.0 <= args.vignette_strength_max <= 1.0:
+        parser.error("--vignette_strength_min/max must be between 0.0 and 1.0.")
+    if args.vignette_strength_min > args.vignette_strength_max:
+        parser.error("--vignette_strength_min cannot exceed --vignette_strength_max.")
     if args.occluder_templates != "auto":
         valid_tpls = {"single", "stack_v", "stack_h", "scatter",
                       "tshape", "lshape", "cross", "hshape", "eshape"}
@@ -861,6 +875,11 @@ def apply_degradation(
     degradation_preset: str = "standard",
     soft_focus_strength: float = 0.0,
     overexposure_prob: float = 0.0,
+    low_light_prob: float = 0.0,
+    low_light_white_range: tuple[float, float] = (45.0, 90.0),
+    low_light_black_range: tuple[float, float] = (4.0, 18.0),
+    vignette_prob: float = 0.0,
+    vignette_strength_range: tuple[float, float] = (0.4, 0.9),
 ) -> np.ndarray:
     """
     Apply realistic image degradation simulating long-distance FSO observation.
@@ -868,6 +887,11 @@ def apply_degradation(
     Args:
         overexposure_prob: Probability of applying overexposure simulation
             (gamma compression + brightness boost) to mimic blown-out scenes.
+        low_light_prob: Probability of remapping the [0, 255] range into a dark
+            band [black, white] to mimic the heavily underexposed captures of the
+            new lens (e.g. 40m_example.png with p1~13 / p99~53).
+        vignette_prob: Probability of applying a smooth radial brightness falloff
+            (lens vignetting) that darkens the corners toward black.
     """
     img = img.astype(np.float32, copy=False)
 
@@ -921,6 +945,30 @@ def apply_degradation(
         map_x = np.arange(w, dtype=np.float32)[None, :] + dx
         map_y = np.arange(h, dtype=np.float32)[:, None] + dy
         img = cv2.remap(img, map_x, map_y, cv2.INTER_LINEAR, borderValue=128)
+
+    # Low-light exposure remap: compress the full [0, 255] range into a dark
+    # band [black, white], reproducing the heavily underexposed new-lens captures
+    # (marker white -> ~white, marker black -> ~black). Applied before noise so
+    # the sensor read noise lands on top of the dark image, as in real low light.
+    if low_light_prob > 0.0 and random.random() < low_light_prob:
+        white = random.uniform(*low_light_white_range)
+        black = random.uniform(*low_light_black_range)
+        if white < black:
+            white, black = black, white
+        img = img / 255.0 * (white - black) + black
+
+    # Lens vignetting: smooth radial brightness falloff toward the corners.
+    if vignette_prob > 0.0 and random.random() < vignette_prob:
+        h, w = img.shape[:2]
+        strength = random.uniform(*vignette_strength_range)
+        # Hot-spot is allowed to drift off-center (new-lens vignette is not centered).
+        cx = (0.5 + random.uniform(-0.15, 0.15)) * w
+        cy = (0.5 + random.uniform(-0.15, 0.15)) * h
+        xx = np.arange(w, dtype=np.float32)[None, :] - cx
+        yy = np.arange(h, dtype=np.float32)[:, None] - cy
+        r2 = (xx * xx + yy * yy) / float(cx * cx + cy * cy + 1e-6)
+        mask = np.clip(1.0 - strength * r2, 0.0, 1.0)
+        img = img * mask
 
     # Gaussian noise (sensor noise, especially at long range)
     noise_std = random.uniform(*noise_std_range)
@@ -1182,7 +1230,10 @@ def sample_marker_center(
         is_partially_out = (
             bbox[0] < 0.0 or bbox[1] < 0.0 or bbox[2] > render_w or bbox[3] > render_h
         )
-        if is_partially_out and 0.08 <= visible_ratio <= 0.95:
+        # Floor at 0.30: below this the model only sees a few short arcs at the
+        # frame edge, which trains it to fire on any high-frequency edge content
+        # (windows, shadows, motion blur trails) as false positives.
+        if is_partially_out and 0.30 <= visible_ratio <= 0.95:
             return cx, cy
         return None
 
@@ -1252,6 +1303,11 @@ def generate_empty_negative_sample(
     contrast_range: tuple[float, float] = (0.6, 1.4),
     motion_blur_prob: float = 0.2,
     scintillation_prob: float = 0.15,
+    low_light_prob: float = 0.0,
+    low_light_white_range: tuple[float, float] = (45.0, 90.0),
+    low_light_black_range: tuple[float, float] = (4.0, 18.0),
+    vignette_prob: float = 0.0,
+    vignette_strength_range: tuple[float, float] = (0.4, 0.9),
 ) -> tuple[np.ndarray, np.ndarray, dict]:
     output_w, output_h = output_size
     heatmap_w = output_w // heatmap_stride
@@ -1273,6 +1329,11 @@ def generate_empty_negative_sample(
         degradation_preset=degradation_preset,
         soft_focus_strength=soft_focus_strength,
         overexposure_prob=overexposure_prob,
+        low_light_prob=low_light_prob,
+        low_light_white_range=low_light_white_range,
+        low_light_black_range=low_light_black_range,
+        vignette_prob=vignette_prob,
+        vignette_strength_range=vignette_strength_range,
     )
     final_img = cv2.resize(bg, (output_w, output_h), interpolation=cv2.INTER_AREA)
     heatmap = generate_negative_heatmap((heatmap_h, heatmap_w))
@@ -1303,6 +1364,11 @@ def generate_marker_sample(
     contrast_range: tuple[float, float] = (0.6, 1.4),
     motion_blur_prob: float = 0.2,
     scintillation_prob: float = 0.15,
+    low_light_prob: float = 0.0,
+    low_light_white_range: tuple[float, float] = (45.0, 90.0),
+    low_light_black_range: tuple[float, float] = (4.0, 18.0),
+    vignette_prob: float = 0.0,
+    vignette_strength_range: tuple[float, float] = (0.4, 0.9),
     occ_distribution: str = "uniform",
     occluder_templates: str = "auto",
 ) -> tuple[np.ndarray, np.ndarray, dict]:
@@ -1362,6 +1428,11 @@ def generate_marker_sample(
         degradation_preset=degradation_preset,
         soft_focus_strength=soft_focus_strength,
         overexposure_prob=overexposure_prob,
+        low_light_prob=low_light_prob,
+        low_light_white_range=low_light_white_range,
+        low_light_black_range=low_light_black_range,
+        vignette_prob=vignette_prob,
+        vignette_strength_range=vignette_strength_range,
     )
     final_img = cv2.resize(bg, (output_w, output_h), interpolation=cv2.INTER_AREA)
 
@@ -1369,9 +1440,14 @@ def generate_marker_sample(
     scale_y = output_h / render_h
     final_cx = cx * scale_x
     final_cy = cy * scale_y
+    # NOTE: marker is rendered with outer-ring radius = render_marker_radius
+    # (= marker_radius * 2 in render space). Sampling here at render_marker_radius
+    # makes ellipse_a/b and bbox describe ring 1 (outer black disc). Using
+    # marker_radius would land on ~50% of outer_r, which coincides with the
+    # innermost ring in cctag3 markers (radii table 90 80 70 60 50).
     transformed_circle_points = sample_circle_points(
         center=(render_cx, render_cy),
-        radius=marker_radius,
+        radius=render_marker_radius,
         perspective_matrix=perspective_matrix,
     )
     bbox = (
@@ -1479,6 +1555,11 @@ def generate_single_sample(
     contrast_range: tuple[float, float] = (0.6, 1.4),
     motion_blur_prob: float = 0.2,
     scintillation_prob: float = 0.15,
+    low_light_prob: float = 0.0,
+    low_light_white_range: tuple[float, float] = (45.0, 90.0),
+    low_light_black_range: tuple[float, float] = (4.0, 18.0),
+    vignette_prob: float = 0.0,
+    vignette_strength_range: tuple[float, float] = (0.4, 0.9),
     occ_distribution: str = "uniform",
     occluder_templates: str = "auto",
 ) -> tuple[np.ndarray, np.ndarray, dict]:
@@ -1508,6 +1589,11 @@ def generate_single_sample(
             contrast_range=contrast_range,
             motion_blur_prob=motion_blur_prob,
             scintillation_prob=scintillation_prob,
+            low_light_prob=low_light_prob,
+            low_light_white_range=low_light_white_range,
+            low_light_black_range=low_light_black_range,
+            vignette_prob=vignette_prob,
+            vignette_strength_range=vignette_strength_range,
         )
 
     desired_target_clamped = None
@@ -1548,6 +1634,11 @@ def generate_single_sample(
             contrast_range=contrast_range,
             motion_blur_prob=motion_blur_prob,
             scintillation_prob=scintillation_prob,
+            low_light_prob=low_light_prob,
+            low_light_white_range=low_light_white_range,
+            low_light_black_range=low_light_black_range,
+            vignette_prob=vignette_prob,
+            vignette_strength_range=vignette_strength_range,
             occ_distribution=occ_distribution,
             occluder_templates=occluder_templates,
         )
@@ -1619,8 +1710,10 @@ def generate_dataset(args):
     img_dir = output_dir / "images"
     hm_dir = output_dir / "heatmaps"
     yolo_dir = output_dir / "labels_yolo"
+    write_heatmaps = not getattr(args, "no_heatmap", False)
     img_dir.mkdir(parents=True, exist_ok=True)
-    hm_dir.mkdir(parents=True, exist_ok=True)
+    if write_heatmaps:
+        hm_dir.mkdir(parents=True, exist_ok=True)
     yolo_dir.mkdir(parents=True, exist_ok=True)
 
     config = {
@@ -1655,6 +1748,11 @@ def generate_dataset(args):
         "contrast_range": [args.contrast_min, args.contrast_max],
         "motion_blur_prob": args.motion_blur_prob,
         "scintillation_prob": args.scintillation_prob,
+        "low_light_prob": args.low_light_prob,
+        "low_light_white_range": [args.low_light_white_min, args.low_light_white_max],
+        "low_light_black_range": [args.low_light_black_min, args.low_light_black_max],
+        "vignette_prob": args.vignette_prob,
+        "vignette_strength_range": [args.vignette_strength_min, args.vignette_strength_max],
         "occ_distribution": args.occ_distribution,
         "occluder_templates": args.occluder_templates,
         "seed": args.seed,
@@ -1721,13 +1819,22 @@ def generate_dataset(args):
             contrast_range=(args.contrast_min, args.contrast_max),
             motion_blur_prob=args.motion_blur_prob,
             scintillation_prob=args.scintillation_prob,
+            low_light_prob=args.low_light_prob,
+            low_light_white_range=(args.low_light_white_min, args.low_light_white_max),
+            low_light_black_range=(args.low_light_black_min, args.low_light_black_max),
+            vignette_prob=args.vignette_prob,
+            vignette_strength_range=(args.vignette_strength_min, args.vignette_strength_max),
             occ_distribution=args.occ_distribution,
             occluder_templates=args.occluder_templates,
         )
 
         fname = f"{i:06d}"
         cv2.imwrite(str(img_dir / f"{fname}.png"), img)
-        np.save(str(hm_dir / f"{fname}.npy"), hm)
+        if write_heatmaps:
+            # Compressed float16 heatmap (key 'heatmap'): ~1 KB vs ~125 KB raw
+            # float64, lossless enough for a [0,1] regression target (max error
+            # <=5e-4). Readers accept both .npz (new) and legacy .npy.
+            np.savez_compressed(str(hm_dir / f"{fname}.npz"), heatmap=hm.astype(np.float16))
         csv_rows.append([
             fname,
             f"{meta['x']:.4f}",
@@ -1790,7 +1897,7 @@ def generate_dataset(args):
     print(f"\nDone! Generated {args.num_images} samples in {elapsed:.1f}s")
     print(f"Output: {output_dir}")
     print(f"  images/     - {args.num_images} PNG files")
-    print(f"  heatmaps/   - {args.num_images} NPY files")
+    print(f"  heatmaps/   - {args.num_images} NPZ files")
     print(
         f"                shape={args.output_size[1] // args.heatmap_stride}x"
         f"{args.output_size[0] // args.heatmap_stride} stride={args.heatmap_stride}"
@@ -1844,6 +1951,10 @@ def main():
                         help="Downsampling factor for heatmap output, e.g. 4 gives WIDTH/4 x HEIGHT/4 heatmaps")
     parser.add_argument("--heatmap_sigma", type=float, default=2.0,
                         help="Gaussian heatmap sigma in heatmap coordinates (default: 2.0)")
+    parser.add_argument("--no_heatmap", action="store_true",
+                        help="Skip writing heatmaps/*.npz. Use for YOLO detection sets "
+                             "(which only need images/ + labels_yolo/); saves disk + I/O. "
+                             "The result is NOT usable for heatmap-regression training.")
     parser.add_argument("--yolo_class_id", type=int, default=0,
                         help="YOLO class id to write into labels_yolo/*.txt")
     parser.add_argument("--degradation_preset", type=str, default="standard",
@@ -1879,6 +1990,24 @@ def main():
     parser.add_argument("--scintillation_prob", type=float, default=0.15,
                         help="Probability of applying atmospheric scintillation warp per sample. "
                              "Ignored when --degradation_preset=soft_focus.")
+    parser.add_argument("--low_light_prob", type=float, default=0.0,
+                        help="Probability of remapping [0,255] into a dark band [black,white] to "
+                             "mimic heavily underexposed low-light captures (new lens). (default: 0.0)")
+    parser.add_argument("--low_light_white_min", type=float, default=45.0,
+                        help="Min target value that marker-white (255) maps to under low-light remap.")
+    parser.add_argument("--low_light_white_max", type=float, default=90.0,
+                        help="Max target value that marker-white (255) maps to under low-light remap.")
+    parser.add_argument("--low_light_black_min", type=float, default=4.0,
+                        help="Min target value that marker-black (0) maps to under low-light remap.")
+    parser.add_argument("--low_light_black_max", type=float, default=18.0,
+                        help="Max target value that marker-black (0) maps to under low-light remap.")
+    parser.add_argument("--vignette_prob", type=float, default=0.0,
+                        help="Probability of applying lens vignetting (radial brightness falloff "
+                             "darkening the corners) per sample. (default: 0.0)")
+    parser.add_argument("--vignette_strength_min", type=float, default=0.4,
+                        help="Min vignette strength (fraction of brightness removed at the corner).")
+    parser.add_argument("--vignette_strength_max", type=float, default=0.9,
+                        help="Max vignette strength (fraction of brightness removed at the corner).")
     parser.add_argument("--occ_distribution", type=str, default="uniform",
                         choices=["uniform", "beta_high", "beta_low"],
                         help="Sampling distribution for target occlusion ratio inside [occ_min, occ_max]. "

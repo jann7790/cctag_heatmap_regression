@@ -9,7 +9,7 @@ if [[ -z "${PYTHON_BIN:-}" ]]; then
   fi
 fi
 GENERATOR="${GENERATOR:-./src/generate_cctag_dataset.py}"
-OUTPUT_ROOT="${OUTPUT_ROOT:-./outputs/training_sets/generated_training_sets}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-./outputs/training_sets/generated_training_sets_1024}"
 
 BASE_COUNT="${BASE_COUNT:-4000}"
 HARD_COUNT="${HARD_COUNT:-3000}"
@@ -26,11 +26,11 @@ if [[ $((BASE_CLEAN_COUNT + BASE_LOW_OCC_COUNT)) -ne ${BASE_COUNT} ]]; then
 fi
 
 common_args=(
-  --output_size 640x400
+  --output_size 1024x640
   --marker_style cctag_source
   --num_rings 3
   --heatmap_stride 4
-  --heatmap_sigma 2.0
+  --heatmap_sigma 3.0
   --partial_out_prob 0.25
   --partial_out_max_ratio 0.25
   --empty_negative_ratio 0.15
@@ -45,7 +45,7 @@ common_args=(
 # soft-focus look.
 lowlight_args=(
   --low_light_prob 0.85
-  --low_light_white_min 45 --low_light_white_max 90
+  --low_light_white_min 25 --low_light_white_max 70
   --low_light_black_min 4 --low_light_black_max 18
   --vignette_prob 0.6
   --vignette_strength_min 0.4 --vignette_strength_max 0.9
@@ -89,7 +89,7 @@ merge_dataset_parts() {
       local new_name
       new_name="$(printf '%06d' "${idx}")"
       cp "${part}/images/${filename}.png" "${merged_dir}/images/${new_name}.png"
-      cp "${part}/heatmaps/${filename}.npy" "${merged_dir}/heatmaps/${new_name}.npy"
+      cp "${part}/heatmaps/${filename}.npz" "${merged_dir}/heatmaps/${new_name}.npz"
       cp "${part}/labels_yolo/${filename}.txt" "${merged_dir}/labels_yolo/${new_name}.txt"
       printf '%s,%s\n' "${new_name}" "${rest}" >> "${merged_dir}/labels.csv"
       idx=$((idx + 1))
@@ -136,8 +136,8 @@ generate_one "base_clean" \
   --num_images "${BASE_CLEAN_COUNT}" \
   --output_dir "${BASE_CLEAN_DIR}" \
   --seed 42 \
-  --marker_min 40 \
-  --marker_max 260 \
+  --marker_min 64 \
+  --marker_max 450 \
   --occ_min 0.0 \
   --occ_max 0.0 \
   --soft_focus_strength 0.0 \
@@ -154,8 +154,8 @@ generate_one "base_low_occ" \
   --num_images "${BASE_LOW_OCC_COUNT}" \
   --output_dir "${BASE_LOW_OCC_DIR}" \
   --seed 43 \
-  --marker_min 40 \
-  --marker_max 260 \
+  --marker_min 64 \
+  --marker_max 450 \
   --occ_min 0.05 \
   --occ_max 0.50 \
   --soft_focus_strength 0.0 \
@@ -179,8 +179,8 @@ generate_one "hard_set" \
   --num_images "${HARD_COUNT}" \
   --output_dir "${HARD_DIR}" \
   --seed 44 \
-  --marker_min 40 \
-  --marker_max 260 \
+  --marker_min 64 \
+  --marker_max 450 \
   --occ_min 0.50 \
   --occ_max 0.85 \
   --soft_focus_strength 0.0 \
@@ -199,8 +199,8 @@ generate_one "small_set" \
   --num_images "${SMALL_COUNT}" \
   --output_dir "${SMALL_DIR}" \
   --seed 46 \
-  --marker_min 18 \
-  --marker_max 70 \
+  --marker_min 29 \
+  --marker_max 112 \
   --occ_min 0.50 \
   --occ_max 0.85 \
   --soft_focus_strength 0.0 \
@@ -219,19 +219,19 @@ generate_one "hard_negative_set" \
   --num_images "${HARD_NEG_COUNT}" \
   --output_dir "${HARD_NEG_DIR}" \
   --seed 47 \
-  --marker_min 40 \
-  --marker_max 260 \
+  --marker_min 64 \
+  --marker_max 450 \
   --occ_min 0.0 \
   --occ_max 0.0 \
   --soft_focus_strength 0.0 \
   --blur_min 0 --blur_max 1 \
   --background_complexity complex \
   --negative_ratio 0.70 \
-  --output_size 640x400 \
+  --output_size 1024x640 \
   --marker_style cctag_source \
   --num_rings 3 \
   --heatmap_stride 4 \
-  --heatmap_sigma 2.0 \
+  --heatmap_sigma 3.0 \
   --partial_out_prob 0.10 \
   --partial_out_max_ratio 0.25 \
   --occlusion_style aggressive \
@@ -246,25 +246,25 @@ generate_one "overexposure_set" \
   --num_images "${OVEREXPOSURE_COUNT}" \
   --output_dir "${OVEREXPOSURE_DIR}" \
   --seed 48 \
-  --marker_min 40 \
-  --marker_max 260 \
+  --marker_min 64 \
+  --marker_max 450 \
   --occ_min 0.0 \
   --occ_max 0.50 \
   --soft_focus_strength 0.0 \
   --blur_min 0 --blur_max 1 \
   --overexposure_prob 0.80 \
   --low_light_prob 0.20 \
-  --low_light_white_min 45 --low_light_white_max 90 \
+  --low_light_white_min 25 --low_light_white_max 70 \
   --low_light_black_min 4 --low_light_black_max 18 \
   --vignette_prob 0.7 \
   --vignette_strength_min 0.4 --vignette_strength_max 0.9 \
   --background_complexity complex \
   --negative_ratio 0.50 \
-  --output_size 640x400 \
+  --output_size 1024x640 \
   --marker_style cctag_source \
   --num_rings 3 \
   --heatmap_stride 4 \
-  --heatmap_sigma 2.0 \
+  --heatmap_sigma 3.0 \
   --partial_out_prob 0.15 \
   --partial_out_max_ratio 0.25 \
   --occlusion_style aggressive

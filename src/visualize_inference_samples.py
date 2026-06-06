@@ -30,9 +30,11 @@ from infer_cctag_heatmap import (
     decode_center_offset,
     decode_center_subpixel,
     decode_center_weighted,
+    load_heatmap,
     load_model,
     preprocess,
     resize_heatmap_to_shape,
+    resolve_heatmap_path,
 )
 
 
@@ -157,7 +159,7 @@ def load_gt_map(suite_dir: Path) -> dict[str, dict[str, Any]]:
             if not filename:
                 continue
             gt_map[filename] = {
-                "heatmap_path": heatmaps_dir / f"{filename}.npy",
+                "heatmap_path": resolve_heatmap_path(heatmaps_dir, filename),
                 "center_x": float(row.get("center_x") or row.get("x") or -1.0),
                 "center_y": float(row.get("center_y") or row.get("y") or -1.0),
                 "is_negative": int(row.get("is_negative") or 0) == 1,
@@ -283,7 +285,7 @@ def main() -> None:
                 gt_row = gt_map.get(stem)
                 p3 = orig_bgr.copy()
                 if gt_row is not None and gt_row["heatmap_path"].is_file():
-                    gt_hm_raw = np.load(gt_row["heatmap_path"]).astype(np.float32)
+                    gt_hm_raw = load_heatmap(gt_row["heatmap_path"])
                     gt_hm = resize_heatmap_to_shape(gt_hm_raw, heatmap.shape)
                     p3 = _overlay_heatmap(orig_bgr.copy(), gt_hm)
                     if not gt_row["is_negative"]:

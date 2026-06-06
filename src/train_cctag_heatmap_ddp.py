@@ -29,6 +29,7 @@ import os
 import random
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -41,12 +42,45 @@ from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import ConcatDataset, DataLoader, Dataset, Subset
 from torch.utils.data.distributed import DistributedSampler
 
-
 IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(3, 1, 1)
 IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(3, 1, 1)
 
+# Floor for ellipse semi-axes before taking log() in the size target.
+# Real positive samples have ellipse_a/b >> 1 px; this only matters for
+# negative rows where the value is 0 (those are masked out by the loss anyway).
+SIZE_TARGET_EPS = 1e-3
 
-def spatial_soft_argmax(heatmap: torch.Tensor, temperature: float = 0.1) -> torch.Tensor:
+
+def resolve_heatmap_path(directory: Path, stem: str) -> Path:
+    """Heatmap file for a stem, preferring compressed .npz over legacy .npy."""
+    npz = directory / f"{stem}.npz"
+    return npz if npz.exists() else directory / f"{stem}.npy"
+
+
+def load_heatmap(path: Path) -> np.ndarray:
+    """Load a heatmap stored as compressed .npz (key 'heatmap') or legacy .npy, as float32."""
+    path = Path(path)
+    if path.suffix == ".npz":
+        with np.load(path) as data:
+            return data["heatmap"].astype(np.float32)
+    return np.load(path).astype(np.float32)
+
+
+@dataclass
+class AugmentConfig:
+    """Online train-time augmentation. Photometric ops touch the image only;
+    horizontal flip also mirrors the heatmap and the center x-coordinates so the
+    label stays consistent. Ellipse a/b and the size target are flip-invariant."""
+
+    hflip_prob: float = 0.5
+    brightness: float = 0.2  # +/- fraction of 255
+    contrast: float = 0.2  # factor in [1-c, 1+c]
+    noise_std: float = 6.0  # max gaussian sigma in 0-255 space
+
+
+def spatial_soft_argmax(
+    heatmap: torch.Tensor, temperature: float = 0.1
+) -> torch.Tensor:
     """Differentiable soft-argmax returning (x, y) in heatmap pixel coords."""
     B, _, H, W = heatmap.shape
     flat = heatmap.view(B, -1) / temperature
@@ -82,7 +116,9 @@ def parse_args() -> argparse.Namespace:
         action="append",
         type=Path,
         default=[],
-        help="Validation dataset root. Repeat this flag to validate on multiple dataset sources.",
+        help="Validation dataset root. Repeat this flag to validate on multiple dataset sources. "
+        "Optional: if omitted while --train_dataset_dir is given, a val split is carved out of "
+        "the merged training data using --train_ratio.",
     )
     parser.add_argument(
         "--output_dir",
@@ -90,7 +126,9 @@ def parse_args() -> argparse.Namespace:
         default=Path("./outputs/runs/cctag_heatmap_ddp"),
         help="Directory for checkpoints and training logs.",
     )
-    parser.add_argument("--epochs", type=int, default=20, help="Number of training epochs.")
+    parser.add_argument(
+        "--epochs", type=int, default=100, help="Number of training epochs."
+    )
     parser.add_argument(
         "--batch_size",
         type=int,
@@ -98,17 +136,29 @@ def parse_args() -> argparse.Namespace:
         help="Per-process mini-batch size. Global batch = batch_size * world_size.",
     )
     parser.add_argument("--lr", type=float, default=1e-3, help="Initial learning rate.")
-    parser.add_argument("--weight_decay", type=float, default=1e-4, help="AdamW weight decay.")
+    parser.add_argument(
+        "--weight_decay", type=float, default=1e-4, help="AdamW weight decay."
+    )
     parser.add_argument(
         "--train_ratio",
         type=float,
         default=0.9,
-        help="Train split ratio. Only used when --train_dataset_dir/--val_dataset_dir are not provided.",
+        help="Train split ratio. Used for the internal val split when no explicit "
+        "--val_dataset_dir is given (single --dataset_dir, or --train_dataset_dir without --val_dataset_dir).",
     )
-    parser.add_argument("--num_workers", type=int, default=4, help="DataLoader worker count per process.")
+    parser.add_argument(
+        "--num_workers",
+        type=int,
+        default=4,
+        help="DataLoader worker count per process.",
+    )
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
-    parser.add_argument("--input_width", type=int, default=640, help="Resized input width.")
-    parser.add_argument("--input_height", type=int, default=400, help="Resized input height.")
+    parser.add_argument(
+        "--input_width", type=int, default=640, help="Resized input width."
+    )
+    parser.add_argument(
+        "--input_height", type=int, default=400, help="Resized input height."
+    )
     parser.add_argument(
         "--save_every",
         type=int,
@@ -130,26 +180,122 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--backbone",
         type=str,
-        default="efficientnet_b0",
+        default="resnet18",
         choices=["efficientnet_b0", "mobilenet_v3_small", "resnet18"],
-        help="Backbone architecture (default: efficientnet_b0).",
+        help="Backbone architecture (default: resnet18).",
     )
-    parser.add_argument("--focal_loss", action="store_true",
-                        help="Replace BCE with Focal Loss to focus on hard false-positive pixels.")
-    parser.add_argument("--focal_alpha", type=float, default=0.25,
-                        help="Focal loss alpha (positive class weight). Default: 0.25.")
-    parser.add_argument("--focal_gamma", type=float, default=2.0,
-                        help="Focal loss gamma (focusing parameter). Default: 2.0.")
-    parser.add_argument("--ohem_ratio", type=float, default=0.0,
-                        help="Online Hard Example Mining: keep only the hardest K%% of pixels for loss. "
-                             "0.0 disables OHEM; 0.3 keeps the hardest 30%%. Only used when --focal_loss is not set.")
-    parser.add_argument("--offset_head", action="store_true",
-                        help="Add a 2-channel offset regression head (CenterNet-style) for sub-pixel center decoding.")
-    parser.add_argument("--offset_weight", type=float, default=1.0,
-                        help="Weight of the offset L1 loss term. Default: 1.0.")
-    parser.add_argument("--resume_from", type=Path, default=None,
-                        help="Path to a checkpoint (.pt). Loads model weights into the new run; "
-                             "optimizer/scheduler/epoch counter start fresh.")
+    parser.add_argument(
+        "--focal_loss",
+        action="store_true",
+        help="Replace BCE with Focal Loss to focus on hard false-positive pixels.",
+    )
+    parser.add_argument(
+        "--focal_alpha",
+        type=float,
+        default=0.25,
+        help="Focal loss alpha (positive class weight). Default: 0.25.",
+    )
+    parser.add_argument(
+        "--focal_gamma",
+        type=float,
+        default=2.0,
+        help="Focal loss gamma (focusing parameter). Default: 2.0.",
+    )
+    parser.add_argument(
+        "--ohem_ratio",
+        type=float,
+        default=0.0,
+        help="Online Hard Example Mining: keep only the hardest K%% of pixels for loss. "
+        "0.0 disables OHEM; 0.3 keeps the hardest 30%%. Only used when --focal_loss is not set.",
+    )
+    parser.add_argument(
+        "--offset_head",
+        action="store_true",
+        help="Add a 2-channel offset regression head (CenterNet-style) for sub-pixel center decoding.",
+    )
+    parser.add_argument(
+        "--offset_weight",
+        type=float,
+        default=1.0,
+        help="Weight of the offset L1 loss term. Default: 1.0.",
+    )
+    parser.add_argument(
+        "--size_head",
+        action="store_true",
+        help="Add a 2-channel size head that regresses log(ellipse_a), log(ellipse_b) "
+        "at the predicted center (source-image pixels).",
+    )
+    parser.add_argument(
+        "--size_weight",
+        type=float,
+        default=1.0,
+        help="Weight of the size smooth-L1 loss term. Default: 1.0.",
+    )
+    parser.add_argument(
+        "--resume_from",
+        type=Path,
+        default=None,
+        help="Path to a checkpoint (.pt). Loads model weights into the new run; "
+        "optimizer/scheduler/epoch counter start fresh.",
+    )
+    # --- performance (Tier 2): all default OFF/identity, no behavior change unless set ---
+    parser.add_argument(
+        "--amp",
+        action="store_true",
+        help="Enable automatic mixed precision (fp16 autocast on the forward pass + "
+        "GradScaler) on CUDA. ~1.5-2x faster and ~half the activation memory. The loss "
+        "is still computed in fp32 (BCELoss is unsafe under autocast).",
+    )
+    parser.add_argument(
+        "--channels_last",
+        action="store_true",
+        help="Use channels_last memory format for the model and inputs (faster conv on "
+        "Tensor Cores). Numerically equivalent.",
+    )
+    parser.add_argument(
+        "--compile",
+        dest="compile_model",
+        action="store_true",
+        help="Wrap the model in torch.compile (PyTorch 2.x graph fusion). One-time warmup "
+        "cost; best with fixed input size (which this training uses).",
+    )
+    parser.add_argument(
+        "--no_cudnn_benchmark",
+        action="store_true",
+        help="Disable cudnn.benchmark autotuning. It is ON by default here because the "
+        "input size is fixed; turn off only for strict determinism.",
+    )
+    # --- online augmentation (Tier 3): OFF unless --augment ---
+    parser.add_argument(
+        "--augment",
+        action="store_true",
+        help="Enable online train-time augmentation (photometric + horizontal flip). "
+        "Validation stays deterministic.",
+    )
+    parser.add_argument(
+        "--aug_hflip_prob",
+        type=float,
+        default=0.5,
+        help="Horizontal-flip probability when --augment. Default: 0.5.",
+    )
+    parser.add_argument(
+        "--aug_brightness",
+        type=float,
+        default=0.2,
+        help="Max brightness jitter as a fraction of 255 (uniform +/-) when --augment.",
+    )
+    parser.add_argument(
+        "--aug_contrast",
+        type=float,
+        default=0.2,
+        help="Max contrast jitter (factor 1 +/- this) when --augment.",
+    )
+    parser.add_argument(
+        "--aug_noise_std",
+        type=float,
+        default=6.0,
+        help="Max gaussian noise std (0-255 space) when --augment.",
+    )
     return parser.parse_args()
 
 
@@ -231,12 +377,18 @@ def reduce_sum(value: float, device: torch.device) -> float:
 
 
 class CCTagHeatmapDataset(Dataset[dict[str, Any]]):
-    def __init__(self, dataset_dir: Path, input_size: tuple[int, int]) -> None:
+    def __init__(
+        self,
+        dataset_dir: Path,
+        input_size: tuple[int, int],
+        augment: AugmentConfig | None = None,
+    ) -> None:
         self.dataset_dir = dataset_dir
         self.images_dir = dataset_dir / "images"
         self.heatmaps_dir = dataset_dir / "heatmaps"
         self.labels_csv = dataset_dir / "labels.csv"
         self.input_width, self.input_height = input_size
+        self.augment = augment
         self.heatmap_width: int | None = None
         self.heatmap_height: int | None = None
         self.samples = self._load_samples()
@@ -258,16 +410,21 @@ class CCTagHeatmapDataset(Dataset[dict[str, Any]]):
                     continue
 
                 image_path = self.images_dir / f"{filename}.png"
-                heatmap_path = self.heatmaps_dir / f"{filename}.npy"
+                heatmap_path = resolve_heatmap_path(self.heatmaps_dir, filename)
                 if not image_path.is_file():
                     raise FileNotFoundError(f"Missing image file: {image_path}")
                 if not heatmap_path.is_file():
                     raise FileNotFoundError(f"Missing heatmap file: {heatmap_path}")
-                heatmap_shape = np.load(heatmap_path, mmap_mode="r").shape
+                heatmap_shape = load_heatmap(heatmap_path).shape
                 if len(heatmap_shape) != 2:
-                    raise ValueError(f"Expected 2D heatmap, got shape {heatmap_shape} at {heatmap_path}")
+                    raise ValueError(
+                        f"Expected 2D heatmap, got shape {heatmap_shape} at {heatmap_path}"
+                    )
                 if self.heatmap_width is None or self.heatmap_height is None:
-                    self.heatmap_height, self.heatmap_width = int(heatmap_shape[0]), int(heatmap_shape[1])
+                    self.heatmap_height, self.heatmap_width = (
+                        int(heatmap_shape[0]),
+                        int(heatmap_shape[1]),
+                    )
                 elif heatmap_shape != (self.heatmap_height, self.heatmap_width):
                     raise ValueError(
                         f"Inconsistent heatmap shape: expected {(self.heatmap_height, self.heatmap_width)}, "
@@ -282,6 +439,8 @@ class CCTagHeatmapDataset(Dataset[dict[str, Any]]):
                         "center_x": float(row.get("center_x") or row.get("x") or 0.0),
                         "center_y": float(row.get("center_y") or row.get("y") or 0.0),
                         "occlusion_ratio": float(row.get("occlusion_ratio") or 0.0),
+                        "ellipse_a": float(row.get("ellipse_a") or 0.0),
+                        "ellipse_b": float(row.get("ellipse_b") or 0.0),
                     }
                 )
 
@@ -301,9 +460,11 @@ class CCTagHeatmapDataset(Dataset[dict[str, Any]]):
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         src_h, src_w = image.shape[:2]
 
-        heatmap = np.load(sample["heatmap_path"]).astype(np.float32)
+        heatmap = load_heatmap(sample["heatmap_path"])
         if heatmap.ndim != 2:
-            raise ValueError(f"Expected 2D heatmap, got shape {heatmap.shape} at {sample['heatmap_path']}")
+            raise ValueError(
+                f"Expected 2D heatmap, got shape {heatmap.shape} at {sample['heatmap_path']}"
+            )
 
         image = cv2.resize(
             image,
@@ -321,20 +482,82 @@ class CCTagHeatmapDataset(Dataset[dict[str, Any]]):
         center_x_heatmap = float(sample["center_x"]) * heatmap_scale_x
         center_y_heatmap = float(sample["center_y"]) * heatmap_scale_y
 
+        if self.augment is not None:
+            (
+                image,
+                heatmap,
+                center_x,
+                center_y,
+                center_x_heatmap,
+                center_y_heatmap,
+            ) = self._apply_augment(
+                image, heatmap, center_x, center_y, center_x_heatmap, center_y_heatmap
+            )
+
         image_tensor = torch.from_numpy(image.transpose(2, 0, 1)).float() / 255.0
         image_tensor = (image_tensor - IMAGENET_MEAN) / IMAGENET_STD
         heatmap_tensor = torch.from_numpy(heatmap[None, ...]).float()
         center_tensor = torch.tensor([center_x, center_y], dtype=torch.float32)
-        heatmap_center_tensor = torch.tensor([center_x_heatmap, center_y_heatmap], dtype=torch.float32)
+        heatmap_center_tensor = torch.tensor(
+            [center_x_heatmap, center_y_heatmap], dtype=torch.float32
+        )
+
+        # Size target in log-space (source-image pixels). EPS floor guards
+        # against log(0) on negative/degenerate rows; the loss masks them out
+        # via the positive-sample mask anyway.
+        ellipse_a = max(float(sample["ellipse_a"]), SIZE_TARGET_EPS)
+        ellipse_b = max(float(sample["ellipse_b"]), SIZE_TARGET_EPS)
+        size_target_tensor = torch.tensor(
+            [math.log(ellipse_a), math.log(ellipse_b)], dtype=torch.float32
+        )
 
         return {
             "image": image_tensor,
             "heatmap": heatmap_tensor,
             "center": center_tensor,
             "heatmap_center": heatmap_center_tensor,
+            "size_target": size_target_tensor,
             "filename": sample["filename"],
-            "occlusion_ratio": torch.tensor(sample["occlusion_ratio"], dtype=torch.float32),
+            "occlusion_ratio": torch.tensor(
+                sample["occlusion_ratio"], dtype=torch.float32
+            ),
         }
+
+    def _apply_augment(
+        self,
+        image: np.ndarray,
+        heatmap: np.ndarray,
+        center_x: float,
+        center_y: float,
+        cx_hm: float,
+        cy_hm: float,
+    ) -> tuple[np.ndarray, np.ndarray, float, float, float, float]:
+        """Photometric jitter (image only) + horizontal flip (image + heatmap +
+        x-coords). Returns contiguous float32 arrays safe for torch.from_numpy."""
+        cfg = self.augment
+        assert cfg is not None
+        img = image.astype(np.float32)
+
+        if random.random() < cfg.hflip_prob:
+            img = img[:, ::-1, :]
+            heatmap = heatmap[:, ::-1]
+            center_x = (self.input_width - 1) - center_x
+            cx_hm = (self.heatmap_width - 1) - cx_hm
+
+        if cfg.contrast > 0:
+            factor = 1.0 + random.uniform(-cfg.contrast, cfg.contrast)
+            mean = float(img.mean())
+            img = (img - mean) * factor + mean
+        if cfg.brightness > 0:
+            img = img + random.uniform(-cfg.brightness, cfg.brightness) * 255.0
+        if cfg.noise_std > 0:
+            sigma = random.uniform(0.0, cfg.noise_std)
+            if sigma > 0:
+                img = img + np.random.normal(0.0, sigma, img.shape).astype(np.float32)
+
+        img = np.ascontiguousarray(np.clip(img, 0.0, 255.0), dtype=np.float32)
+        heatmap = np.ascontiguousarray(heatmap, dtype=np.float32)
+        return img, heatmap, center_x, center_y, cx_hm, cy_hm
 
 
 class HeatmapDiceLoss(nn.Module):
@@ -375,9 +598,16 @@ class HeatmapFocalLoss(nn.Module):
 
 
 class CombinedHeatmapLoss(nn.Module):
-    def __init__(self, center_weight: float = 0.1, use_focal: bool = False,
-                 focal_alpha: float = 0.25, focal_gamma: float = 2.0,
-                 ohem_ratio: float = 0.0, offset_weight: float = 1.0) -> None:
+    def __init__(
+        self,
+        center_weight: float = 0.1,
+        use_focal: bool = False,
+        focal_alpha: float = 0.25,
+        focal_gamma: float = 2.0,
+        ohem_ratio: float = 0.0,
+        offset_weight: float = 1.0,
+        size_weight: float = 1.0,
+    ) -> None:
         super().__init__()
         if use_focal:
             self.pixel_loss = HeatmapFocalLoss(alpha=focal_alpha, gamma=focal_gamma)
@@ -388,8 +618,11 @@ class CombinedHeatmapLoss(nn.Module):
         self.use_focal = use_focal
         self.ohem_ratio = ohem_ratio
         self.offset_weight = offset_weight
+        self.size_weight = size_weight
 
-    def _pixel_term(self, prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    def _pixel_term(
+        self, prediction: torch.Tensor, target: torch.Tensor
+    ) -> torch.Tensor:
         if self.ohem_ratio > 0 and not self.use_focal:
             per_pixel = self.pixel_loss(prediction, target)
             flat = per_pixel.flatten()
@@ -404,8 +637,12 @@ class CombinedHeatmapLoss(nn.Module):
         target: torch.Tensor,
         heatmap_centers: torch.Tensor | None = None,
         offset_pred: torch.Tensor | None = None,
+        size_pred: torch.Tensor | None = None,
+        size_target: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        heatmap_loss = 0.5 * self._pixel_term(prediction, target) + 0.5 * self.dice(prediction, target)
+        heatmap_loss = 0.5 * self._pixel_term(prediction, target) + 0.5 * self.dice(
+            prediction, target
+        )
         total = heatmap_loss
 
         # Sub-pixel offset L1 loss (CenterNet-style): supervise offset only at the GT peak,
@@ -413,17 +650,43 @@ class CombinedHeatmapLoss(nn.Module):
         if offset_pred is not None and heatmap_centers is not None:
             pos_mask = target.flatten(1).max(dim=1).values > 0.1
             if pos_mask.any():
-                centers_pos = heatmap_centers[pos_mask]                     # (P, 2)
-                offset_pos = offset_pred[pos_mask]                          # (P, 2, H, W)
+                centers_pos = heatmap_centers[pos_mask]  # (P, 2)
+                offset_pos = offset_pred[pos_mask]  # (P, 2, H, W)
                 _, _, H, W = offset_pos.shape
                 peak_int = centers_pos.round().long()
                 peak_int[:, 0].clamp_(0, W - 1)
                 peak_int[:, 1].clamp_(0, H - 1)
-                offset_target = centers_pos - peak_int.float()              # (P, 2) in [-0.5, 0.5]
+                offset_target = centers_pos - peak_int.float()  # (P, 2) in [-0.5, 0.5]
                 p_idx = torch.arange(offset_pos.shape[0], device=offset_pos.device)
-                offset_at_peak = offset_pos[p_idx, :, peak_int[:, 1], peak_int[:, 0]]  # (P, 2)
-                offset_loss = nn.functional.smooth_l1_loss(offset_at_peak, offset_target)
+                offset_at_peak = offset_pos[
+                    p_idx, :, peak_int[:, 1], peak_int[:, 0]
+                ]  # (P, 2)
+                offset_loss = nn.functional.smooth_l1_loss(
+                    offset_at_peak, offset_target
+                )
                 total = total + self.offset_weight * offset_loss
+
+        # Scale (ellipse a/b in log-space) smooth-L1 loss at the GT peak, positives only.
+        if (
+            size_pred is not None
+            and size_target is not None
+            and heatmap_centers is not None
+        ):
+            pos_mask = target.flatten(1).max(dim=1).values > 0.1
+            if pos_mask.any():
+                centers_pos = heatmap_centers[pos_mask]
+                size_pos = size_pred[pos_mask]  # (P, 2, H, W)
+                target_pos = size_target[pos_mask]  # (P, 2) in log-space
+                _, _, H, W = size_pos.shape
+                peak_int = centers_pos.round().long()
+                peak_int[:, 0].clamp_(0, W - 1)
+                peak_int[:, 1].clamp_(0, H - 1)
+                p_idx = torch.arange(size_pos.shape[0], device=size_pos.device)
+                size_at_peak = size_pos[
+                    p_idx, :, peak_int[:, 1], peak_int[:, 0]
+                ]  # (P, 2)
+                size_loss = nn.functional.smooth_l1_loss(size_at_peak, target_pos)
+                total = total + self.size_weight * size_loss
 
         if heatmap_centers is not None:
             # Soft-argmax center loss (legacy term, only on positive samples).
@@ -451,13 +714,19 @@ class CCTagNet(nn.Module):
     SKIP_INDICES = (1, 2, 3, 4)
     SKIP_CHANNELS = (16, 24, 40, 80)
 
-    def __init__(self, heatmap_size: tuple[int, int], use_offset_head: bool = False) -> None:
+    def __init__(
+        self,
+        heatmap_size: tuple[int, int],
+        use_offset_head: bool = False,
+        use_size_head: bool = False,
+    ) -> None:
         super().__init__()
         efficientnet_b0, EfficientNet_B0_Weights = ensure_torchvision()
         backbone = efficientnet_b0(weights=EfficientNet_B0_Weights.DEFAULT)
         self.encoder = backbone.features
         self.heatmap_height, self.heatmap_width = heatmap_size
         self.use_offset_head = use_offset_head
+        self.use_size_head = use_size_head
 
         # Decoder: 4 upsample stages with skip-connection concatenation
         # stage 1: up 32→16, cat features[4] (80ch)
@@ -472,6 +741,8 @@ class CCTagNet(nn.Module):
         self.head = nn.Sequential(nn.Conv2d(32, 1, kernel_size=1), nn.Sigmoid())
         if use_offset_head:
             self.offset_head = nn.Conv2d(32, 2, kernel_size=1)
+        if use_size_head:
+            self.size_head = nn.Conv2d(32, 2, kernel_size=1)
 
     @staticmethod
     def _dec_block(in_ch: int, out_ch: int) -> nn.Sequential:
@@ -491,12 +762,18 @@ class CCTagNet(nn.Module):
 
     @staticmethod
     def _up_cat(x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
-        x = nn.functional.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False)
+        x = nn.functional.interpolate(
+            x, scale_factor=2, mode="bilinear", align_corners=False
+        )
         if x.shape[2:] != skip.shape[2:]:
-            skip = nn.functional.interpolate(skip, size=x.shape[2:], mode="bilinear", align_corners=False)
+            skip = nn.functional.interpolate(
+                skip, size=x.shape[2:], mode="bilinear", align_corners=False
+            )
         return torch.cat([x, skip], dim=1)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self, x: torch.Tensor
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
         bottleneck, (s16, s24, s40, s80) = self._encode(x)
 
         x = self.dec1(self._up_cat(bottleneck, s80))
@@ -511,6 +788,7 @@ class CCTagNet(nn.Module):
             mode="bilinear",
             align_corners=False,
         )
+        offset = None
         if self.use_offset_head:
             offset = nn.functional.interpolate(
                 self.offset_head(feat),
@@ -518,7 +796,16 @@ class CCTagNet(nn.Module):
                 mode="bilinear",
                 align_corners=False,
             )
-            return heatmap, offset
+        size = None
+        if self.use_size_head:
+            size = nn.functional.interpolate(
+                self.size_head(feat),
+                size=(self.heatmap_height, self.heatmap_width),
+                mode="bilinear",
+                align_corners=False,
+            )
+        if self.use_offset_head or self.use_size_head:
+            return heatmap, offset, size
         return heatmap
 
 
@@ -537,13 +824,19 @@ class CCTagNetMobileV3(nn.Module):
     SKIP_CHANNELS = (16, 16, 24, 48)
     BOTTLENECK_CHANNELS = 576
 
-    def __init__(self, heatmap_size: tuple[int, int], use_offset_head: bool = False) -> None:
+    def __init__(
+        self,
+        heatmap_size: tuple[int, int],
+        use_offset_head: bool = False,
+        use_size_head: bool = False,
+    ) -> None:
         super().__init__()
         mobilenet_v3_small, MobileNet_V3_Small_Weights = ensure_mobilenet_v3_small()
         backbone = mobilenet_v3_small(weights=MobileNet_V3_Small_Weights.DEFAULT)
         self.encoder = backbone.features
         self.heatmap_height, self.heatmap_width = heatmap_size
         self.use_offset_head = use_offset_head
+        self.use_size_head = use_size_head
 
         self.dec1 = self._dec_block(self.BOTTLENECK_CHANNELS + 48, 128)
         self.dec2 = self._dec_block(128 + 24, 64)
@@ -552,6 +845,8 @@ class CCTagNetMobileV3(nn.Module):
         self.head = nn.Sequential(nn.Conv2d(16, 1, kernel_size=1), nn.Sigmoid())
         if use_offset_head:
             self.offset_head = nn.Conv2d(16, 2, kernel_size=1)
+        if use_size_head:
+            self.size_head = nn.Conv2d(16, 2, kernel_size=1)
 
     @staticmethod
     def _dec_block(in_ch: int, out_ch: int) -> nn.Sequential:
@@ -571,12 +866,18 @@ class CCTagNetMobileV3(nn.Module):
 
     @staticmethod
     def _up_cat(x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
-        x = nn.functional.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False)
+        x = nn.functional.interpolate(
+            x, scale_factor=2, mode="bilinear", align_corners=False
+        )
         if x.shape[2:] != skip.shape[2:]:
-            skip = nn.functional.interpolate(skip, size=x.shape[2:], mode="bilinear", align_corners=False)
+            skip = nn.functional.interpolate(
+                skip, size=x.shape[2:], mode="bilinear", align_corners=False
+            )
         return torch.cat([x, skip], dim=1)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self, x: torch.Tensor
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
         bottleneck, (s16_s2, s16_s4, s24, s48) = self._encode(x)
         x = self.dec1(self._up_cat(bottleneck, s48))
         x = self.dec2(self._up_cat(x, s24))
@@ -584,15 +885,29 @@ class CCTagNetMobileV3(nn.Module):
         x = self.dec4(self._up_cat(x, s16_s2))
         feat = x
         heatmap = nn.functional.interpolate(
-            self.head(feat), size=(self.heatmap_height, self.heatmap_width),
-            mode="bilinear", align_corners=False,
+            self.head(feat),
+            size=(self.heatmap_height, self.heatmap_width),
+            mode="bilinear",
+            align_corners=False,
         )
+        offset = None
         if self.use_offset_head:
             offset = nn.functional.interpolate(
-                self.offset_head(feat), size=(self.heatmap_height, self.heatmap_width),
-                mode="bilinear", align_corners=False,
+                self.offset_head(feat),
+                size=(self.heatmap_height, self.heatmap_width),
+                mode="bilinear",
+                align_corners=False,
             )
-            return heatmap, offset
+        size = None
+        if self.use_size_head:
+            size = nn.functional.interpolate(
+                self.size_head(feat),
+                size=(self.heatmap_height, self.heatmap_width),
+                mode="bilinear",
+                align_corners=False,
+            )
+        if self.use_offset_head or self.use_size_head:
+            return heatmap, offset, size
         return heatmap
 
 
@@ -607,7 +922,12 @@ class CCTagNetResNet18(nn.Module):
     Bottleneck (layer4) → 512ch, stride 32
     """
 
-    def __init__(self, heatmap_size: tuple[int, int], use_offset_head: bool = False) -> None:
+    def __init__(
+        self,
+        heatmap_size: tuple[int, int],
+        use_offset_head: bool = False,
+        use_size_head: bool = False,
+    ) -> None:
         super().__init__()
         resnet18, ResNet18_Weights = ensure_resnet18()
         backbone = resnet18(weights=ResNet18_Weights.DEFAULT)
@@ -623,6 +943,7 @@ class CCTagNetResNet18(nn.Module):
         self.layer4 = backbone.layer4
         self.heatmap_height, self.heatmap_width = heatmap_size
         self.use_offset_head = use_offset_head
+        self.use_size_head = use_size_head
 
         self.dec1 = self._dec_block(512 + 256, 256)
         self.dec2 = self._dec_block(256 + 128, 128)
@@ -631,6 +952,8 @@ class CCTagNetResNet18(nn.Module):
         self.head = nn.Sequential(nn.Conv2d(32, 1, kernel_size=1), nn.Sigmoid())
         if use_offset_head:
             self.offset_head = nn.Conv2d(32, 2, kernel_size=1)
+        if use_size_head:
+            self.size_head = nn.Conv2d(32, 2, kernel_size=1)
 
     @staticmethod
     def _dec_block(in_ch: int, out_ch: int) -> nn.Sequential:
@@ -642,12 +965,20 @@ class CCTagNetResNet18(nn.Module):
 
     @staticmethod
     def _up_cat(x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
-        x = nn.functional.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False)
+        x = nn.functional.interpolate(
+            x, scale_factor=2, mode="bilinear", align_corners=False
+        )
         if x.shape[2:] != skip.shape[2:]:
-            skip = nn.functional.interpolate(skip, size=x.shape[2:], mode="bilinear", align_corners=False)
+            skip = nn.functional.interpolate(
+                skip, size=x.shape[2:], mode="bilinear", align_corners=False
+            )
         return torch.cat([x, skip], dim=1)
 
-    def _encode(self, x: torch.Tensor) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
+    def _encode(
+        self, x: torch.Tensor
+    ) -> tuple[
+        torch.Tensor, tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+    ]:
         s64_s2 = self.stem(x)
         x = self.maxpool(s64_s2)
         s64_s4 = self.layer1(x)
@@ -656,7 +987,9 @@ class CCTagNetResNet18(nn.Module):
         bottleneck = self.layer4(s256_s16)
         return bottleneck, (s64_s2, s64_s4, s128_s8, s256_s16)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self, x: torch.Tensor
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
         bottleneck, (s64_s2, s64_s4, s128_s8, s256_s16) = self._encode(x)
         x = self.dec1(self._up_cat(bottleneck, s256_s16))
         x = self.dec2(self._up_cat(x, s128_s8))
@@ -669,6 +1002,7 @@ class CCTagNetResNet18(nn.Module):
             mode="bilinear",
             align_corners=False,
         )
+        offset = None
         if self.use_offset_head:
             offset = nn.functional.interpolate(
                 self.offset_head(feat),
@@ -676,32 +1010,59 @@ class CCTagNetResNet18(nn.Module):
                 mode="bilinear",
                 align_corners=False,
             )
-            return heatmap, offset
+        size = None
+        if self.use_size_head:
+            size = nn.functional.interpolate(
+                self.size_head(feat),
+                size=(self.heatmap_height, self.heatmap_width),
+                mode="bilinear",
+                align_corners=False,
+            )
+        if self.use_offset_head or self.use_size_head:
+            return heatmap, offset, size
         return heatmap
 
 
-def split_dataset(dataset: Dataset[Any], train_ratio: float, seed: int) -> tuple[Subset[Any], Subset[Any]]:
+def split_dataset(
+    dataset: Dataset[Any], train_ratio: float, seed: int
+) -> tuple[Subset[Any], Subset[Any]]:
+    train_indices, val_indices = split_indices(len(dataset), train_ratio, seed)
+    return Subset(dataset, train_indices), Subset(dataset, val_indices)
+
+
+def split_indices(n: int, train_ratio: float, seed: int) -> tuple[list[int], list[int]]:
+    """Deterministic shuffled train/val index split. Shared so two dataset
+    instances over the same dir (augmented train, plain val) stay disjoint."""
     if not 0.0 < train_ratio < 1.0:
         raise ValueError(f"--train_ratio must be between 0 and 1, got {train_ratio}")
 
-    indices = list(range(len(dataset)))
+    indices = list(range(n))
     rng = random.Random(seed)
     rng.shuffle(indices)
 
-    train_size = max(1, int(len(indices) * train_ratio))
-    val_size = len(indices) - train_size
-    if val_size == 0:
-        train_size = len(indices) - 1
-        val_size = 1
+    train_size = max(1, int(n * train_ratio))
+    if n - train_size == 0:
+        train_size = n - 1
+    return indices[:train_size], indices[train_size:]
 
-    train_indices = indices[:train_size]
-    val_indices = indices[train_size:]
-    return Subset(dataset, train_indices), Subset(dataset, val_indices)
+
+def build_augment_config(args: argparse.Namespace) -> AugmentConfig | None:
+    """Return an AugmentConfig when --augment is set, else None (no augmentation)."""
+    if not getattr(args, "augment", False):
+        return None
+    return AugmentConfig(
+        hflip_prob=args.aug_hflip_prob,
+        brightness=args.aug_brightness,
+        contrast=args.aug_contrast,
+        noise_std=args.aug_noise_std,
+    )
 
 
 def get_dataset_heatmap_size(dataset: CCTagHeatmapDataset) -> tuple[int, int]:
     if dataset.heatmap_height is None or dataset.heatmap_width is None:
-        raise ValueError(f"Failed to infer heatmap size from dataset: {dataset.dataset_dir}")
+        raise ValueError(
+            f"Failed to infer heatmap size from dataset: {dataset.dataset_dir}"
+        )
     return dataset.heatmap_height, dataset.heatmap_width
 
 
@@ -709,8 +1070,14 @@ def build_dataset_collection(
     dataset_dirs: list[Path],
     input_size: tuple[int, int],
     split_name: str,
+    augment: AugmentConfig | None = None,
 ) -> tuple[Dataset[Any], int, tuple[int, int]]:
-    datasets = [CCTagHeatmapDataset(dataset_dir=dataset_dir, input_size=input_size) for dataset_dir in dataset_dirs]
+    datasets = [
+        CCTagHeatmapDataset(
+            dataset_dir=dataset_dir, input_size=input_size, augment=augment
+        )
+        for dataset_dir in dataset_dirs
+    ]
     if not datasets:
         raise ValueError(f"No datasets provided for {split_name}")
 
@@ -729,16 +1096,28 @@ def build_dataset_collection(
     return merged_dataset, sum(len(dataset) for dataset in datasets), heatmap_size
 
 
-def resolve_dataset_sources(args: argparse.Namespace) -> tuple[list[Path] | None, list[Path] | None]:
+def resolve_dataset_sources(
+    args: argparse.Namespace,
+) -> tuple[list[Path] | None, list[Path] | None]:
+    """Resolve explicit train/val dataset sources.
+
+    Returns ``(train_dirs, val_dirs)`` where:
+      - both None              -> fall back to the single --dataset_dir.
+      - (train_dirs, val_dirs) -> explicit train and val sources.
+      - (train_dirs, None)     -> one or more train sources; the val split is
+                                  carved out of the merged training data using
+                                  --train_ratio (seeded, disjoint).
+    """
     train_dirs = list(args.train_dataset_dirs)
     val_dirs = list(args.val_dataset_dirs)
 
-    if train_dirs or val_dirs:
-        if not train_dirs or not val_dirs:
-            raise ValueError(
-                "Provide both --train_dataset_dir and --val_dataset_dir when using explicit multi-source datasets."
-            )
-        return train_dirs, val_dirs
+    if val_dirs and not train_dirs:
+        raise ValueError(
+            "--val_dataset_dir requires --train_dataset_dir. Provide training "
+            "sources too, or use a single --dataset_dir with an internal split."
+        )
+    if train_dirs:
+        return train_dirs, (val_dirs or None)
 
     return None, None
 
@@ -747,34 +1126,76 @@ def create_dataloaders(
     args: argparse.Namespace,
     rank: int,
     world_size: int,
-) -> tuple[DataLoader[Any], DataLoader[Any], int, tuple[int, int], DistributedSampler[Any] | None]:
+) -> tuple[
+    DataLoader[Any],
+    DataLoader[Any],
+    int,
+    tuple[int, int],
+    DistributedSampler[Any] | None,
+]:
+    aug_cfg = build_augment_config(args)
     explicit_train_dirs, explicit_val_dirs = resolve_dataset_sources(args)
     if explicit_train_dirs is not None and explicit_val_dirs is not None:
         train_set, train_size, heatmap_size = build_dataset_collection(
             explicit_train_dirs,
             input_size=(args.input_width, args.input_height),
             split_name="train",
+            augment=aug_cfg,
         )
         val_set, val_size, val_heatmap_size = build_dataset_collection(
             explicit_val_dirs,
             input_size=(args.input_width, args.input_height),
             split_name="val",
+            augment=None,  # validation stays deterministic
         )
         if val_heatmap_size != heatmap_size:
             raise ValueError(
                 f"Train/val heatmap size mismatch: train={heatmap_size}, val={val_heatmap_size}"
             )
         dataset_size = train_size + val_size
-    else:
-        dataset = CCTagHeatmapDataset(
-            dataset_dir=args.dataset_dir,
+    elif explicit_train_dirs is not None:
+        # One or more train sources, no explicit val: merge them and carve out a
+        # val split with the seeded --train_ratio index split. Build two merged
+        # collections over the same dirs so train can augment while val stays
+        # deterministic; the shared seeded split keeps the two subsets disjoint.
+        train_base, base_size, heatmap_size = build_dataset_collection(
+            explicit_train_dirs,
             input_size=(args.input_width, args.input_height),
+            split_name="train",
+            augment=aug_cfg,
         )
-        train_set, val_set = split_dataset(dataset, args.train_ratio, args.seed)
+        val_base, _, _ = build_dataset_collection(
+            explicit_train_dirs,
+            input_size=(args.input_width, args.input_height),
+            split_name="val",
+            augment=None,
+        )
+        train_idx, val_idx = split_indices(base_size, args.train_ratio, args.seed)
+        train_set = Subset(train_base, train_idx)
+        val_set = Subset(val_base, val_idx)
         train_size = len(train_set)
         val_size = len(val_set)
-        dataset_size = len(dataset)
-        heatmap_size = get_dataset_heatmap_size(dataset)
+        dataset_size = base_size
+    else:
+        # Two instances over the same dir so the train split can augment while the
+        # val split stays deterministic; the seeded index split keeps them disjoint.
+        train_base = CCTagHeatmapDataset(
+            dataset_dir=args.dataset_dir,
+            input_size=(args.input_width, args.input_height),
+            augment=aug_cfg,
+        )
+        val_base = CCTagHeatmapDataset(
+            dataset_dir=args.dataset_dir,
+            input_size=(args.input_width, args.input_height),
+            augment=None,
+        )
+        train_idx, val_idx = split_indices(len(train_base), args.train_ratio, args.seed)
+        train_set = Subset(train_base, train_idx)
+        val_set = Subset(val_base, val_idx)
+        train_size = len(train_set)
+        val_size = len(val_set)
+        dataset_size = len(train_base)
+        heatmap_size = get_dataset_heatmap_size(train_base)
 
     train_sampler = None
     val_sampler = None
@@ -817,7 +1238,9 @@ def create_dataloaders(
     return train_loader, val_loader, dataset_size, heatmap_size, train_sampler
 
 
-def decode_heatmap_centers(heatmaps: torch.Tensor, offsets: torch.Tensor | None = None) -> torch.Tensor:
+def decode_heatmap_centers(
+    heatmaps: torch.Tensor, offsets: torch.Tensor | None = None
+) -> torch.Tensor:
     """Peak localization (batched, GPU-friendly).
 
     If `offsets` (B, 2, H, W) is given, decode as integer argmax + offset[peak] (CenterNet style).
@@ -843,14 +1266,18 @@ def decode_heatmap_centers(heatmaps: torch.Tensor, offsets: torch.Tensor | None 
     results_y = torch.zeros(batch_size, device=hm.device)
     for i in range(batch_size):
         cy, cx = int(py[i].item()), int(px[i].item())
-        region = padded[i, cy:cy + 2 * radius + 1, cx:cx + 2 * radius + 1]
+        region = padded[i, cy : cy + 2 * radius + 1, cx : cx + 2 * radius + 1]
         total = region.sum()
         if total < 1e-12:
             results_x[i] = float(cx)
             results_y[i] = float(cy)
             continue
-        yy = torch.arange(cy - radius, cy + radius + 1, device=hm.device, dtype=hm.dtype)
-        xx = torch.arange(cx - radius, cx + radius + 1, device=hm.device, dtype=hm.dtype)
+        yy = torch.arange(
+            cy - radius, cy + radius + 1, device=hm.device, dtype=hm.dtype
+        )
+        xx = torch.arange(
+            cx - radius, cx + radius + 1, device=hm.device, dtype=hm.dtype
+        )
         grid_y, grid_x = torch.meshgrid(yy, xx, indexing="ij")
         results_x[i] = (grid_x * region).sum() / total
         results_y[i] = (grid_y * region).sum() / total
@@ -886,10 +1313,32 @@ def compute_detection_counts(
     pred_has_object = pred_peak >= peak_threshold
     gt_has_object = gt_peak > 0.1
 
-    tp = int(torch.logical_and(gt_has_object, pred_has_object).sum().detach().cpu().item())
-    fp = int(torch.logical_and(torch.logical_not(gt_has_object), pred_has_object).sum().detach().cpu().item())
-    fn = int(torch.logical_and(gt_has_object, torch.logical_not(pred_has_object)).sum().detach().cpu().item())
-    tn = int(torch.logical_and(torch.logical_not(gt_has_object), torch.logical_not(pred_has_object)).sum().detach().cpu().item())
+    tp = int(
+        torch.logical_and(gt_has_object, pred_has_object).sum().detach().cpu().item()
+    )
+    fp = int(
+        torch.logical_and(torch.logical_not(gt_has_object), pred_has_object)
+        .sum()
+        .detach()
+        .cpu()
+        .item()
+    )
+    fn = int(
+        torch.logical_and(gt_has_object, torch.logical_not(pred_has_object))
+        .sum()
+        .detach()
+        .cpu()
+        .item()
+    )
+    tn = int(
+        torch.logical_and(
+            torch.logical_not(gt_has_object), torch.logical_not(pred_has_object)
+        )
+        .sum()
+        .detach()
+        .cpu()
+        .item()
+    )
     return tp, fp, fn, tn
 
 
@@ -899,10 +1348,19 @@ def safe_divide(numerator: float, denominator: float) -> float:
     return numerator / denominator
 
 
-def _split_pred(out: torch.Tensor | tuple[torch.Tensor, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor | None]:
-    if isinstance(out, tuple):
-        return out[0], out[1]
-    return out, None
+def _split_pred(
+    out: torch.Tensor | tuple[torch.Tensor, ...],
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+    """Unpack model output into (heatmap, offset_or_None, size_or_None).
+
+    Accepts either a bare heatmap tensor, a legacy 2-tuple (heatmap, offset),
+    or the current 3-tuple (heatmap, offset_or_None, size_or_None).
+    """
+    if not isinstance(out, tuple):
+        return out, None, None
+    if len(out) == 2:
+        return out[0], out[1], None
+    return out[0], out[1], out[2]
 
 
 def train_one_epoch(
@@ -911,6 +1369,9 @@ def train_one_epoch(
     optimizer: torch.optim.Optimizer,
     criterion: nn.Module,
     device: torch.device,
+    scaler: "torch.amp.GradScaler | None" = None,
+    use_amp: bool = False,
+    channels_last: bool = False,
 ) -> float:
     model.train()
     running_loss = 0.0
@@ -918,14 +1379,38 @@ def train_one_epoch(
 
     for batch in loader:
         images = batch["image"].to(device, non_blocking=True)
+        if channels_last:
+            images = images.to(memory_format=torch.channels_last)
         targets = batch["heatmap"].to(device, non_blocking=True)
         heatmap_centers = batch["heatmap_center"].to(device, non_blocking=True)
+        size_target = batch.get("size_target")
+        if size_target is not None:
+            size_target = size_target.to(device, non_blocking=True)
 
         optimizer.zero_grad(set_to_none=True)
-        predictions, offset_pred = _split_pred(model(images))
-        loss = criterion(predictions, targets, heatmap_centers=heatmap_centers, offset_pred=offset_pred)
-        loss.backward()
-        optimizer.step()
+        # autocast only wraps the forward pass; the loss is computed in fp32 because
+        # BCELoss is unsafe under fp16 autocast. Cast the fp16 outputs back to fp32.
+        with torch.autocast(device_type=device.type, enabled=use_amp):
+            raw_out = model(images)
+        predictions, offset_pred, size_pred = _split_pred(raw_out)
+        predictions = predictions.float()
+        offset_pred = offset_pred.float() if offset_pred is not None else None
+        size_pred = size_pred.float() if size_pred is not None else None
+        loss = criterion(
+            predictions,
+            targets,
+            heatmap_centers=heatmap_centers,
+            offset_pred=offset_pred,
+            size_pred=size_pred,
+            size_target=size_target if size_pred is not None else None,
+        )
+        if scaler is not None and scaler.is_enabled():
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            optimizer.step()
 
         batch_size = images.size(0)
         running_loss += tensor_to_float(loss) * batch_size
@@ -943,6 +1428,8 @@ def validate(
     criterion: nn.Module,
     device: torch.device,
     input_size: tuple[int, int],
+    use_amp: bool = False,
+    channels_last: bool = False,
 ) -> dict[str, float]:
     model.eval()
     running_loss = 0.0
@@ -956,10 +1443,16 @@ def validate(
 
     for batch in loader:
         images = batch["image"].to(device, non_blocking=True)
+        if channels_last:
+            images = images.to(memory_format=torch.channels_last)
         targets = batch["heatmap"].to(device, non_blocking=True)
         centers = batch["center"].to(device, non_blocking=True)
 
-        predictions, offset_pred = _split_pred(model(images))
+        with torch.autocast(device_type=device.type, enabled=use_amp):
+            raw_out = model(images)
+        predictions, offset_pred, _size_pred = _split_pred(raw_out)
+        predictions = predictions.float()
+        offset_pred = offset_pred.float() if offset_pred is not None else None
         loss = criterion(predictions, targets)
         pos_mask = targets.flatten(1).max(dim=1).values > 0.1
         center_distance_sum = 0.0
@@ -972,7 +1465,9 @@ def validate(
                 input_size,
                 offsets=offsets_pos,
             )
-        batch_tp, batch_fp, batch_fn, batch_tn = compute_detection_counts(predictions, targets)
+        batch_tp, batch_fp, batch_fn, batch_tn = compute_detection_counts(
+            predictions, targets
+        )
 
         batch_size = images.size(0)
         running_loss += tensor_to_float(loss) * batch_size
@@ -1006,6 +1501,15 @@ def validate(
     }
 
 
+def _unwrap_model(model: nn.Module) -> nn.Module:
+    """Strip torch.compile (OptimizedModule._orig_mod) and DDP (.module) wrappers
+    so saved state_dict keys match the raw model that inference loads."""
+    inner = getattr(model, "_orig_mod", model)  # torch.compile wrapper
+    if isinstance(inner, DistributedDataParallel):
+        inner = inner.module
+    return inner
+
+
 def save_checkpoint(
     checkpoint_path: Path,
     model: nn.Module,
@@ -1019,10 +1523,7 @@ def save_checkpoint(
     if not is_main_process():
         return
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-    if isinstance(model, DistributedDataParallel):
-        state_dict = model.module.state_dict()
-    else:
-        state_dict = model.state_dict()
+    state_dict = _unwrap_model(model).state_dict()
     torch.save(
         {
             "epoch": epoch,
@@ -1030,7 +1531,14 @@ def save_checkpoint(
             "optimizer_state_dict": optimizer.state_dict(),
             "scheduler_state_dict": scheduler.state_dict(),
             "best_val_loss": best_val_loss,
-            "config": {**vars(args), "world_size": world_size, "backbone": getattr(args, "backbone", "efficientnet_b0")},
+            "config": {
+                **vars(args),
+                "world_size": world_size,
+                "backbone": getattr(args, "backbone", "efficientnet_b0"),
+                # Canonical head flags read by inference / benchmark.
+                "use_offset_head": bool(getattr(args, "offset_head", False)),
+                "use_size_head": bool(getattr(args, "size_head", False)),
+            },
         },
         checkpoint_path,
     )
@@ -1066,16 +1574,22 @@ def write_run_config(
         "lr": args.lr,
         "weight_decay": args.weight_decay,
         "train_ratio": args.train_ratio,
-        "uses_explicit_train_val_datasets": bool(args.train_dataset_dirs or args.val_dataset_dirs),
+        "uses_explicit_train_val_datasets": bool(
+            args.train_dataset_dirs or args.val_dataset_dirs
+        ),
         "seed": args.seed,
         "device": str(device),
         "world_size": world_size,
         "use_offset_head": bool(getattr(args, "offset_head", False)),
         "offset_weight": float(getattr(args, "offset_weight", 1.0)),
+        "use_size_head": bool(getattr(args, "size_head", False)),
+        "size_weight": float(getattr(args, "size_weight", 1.0)),
         "use_focal": bool(getattr(args, "focal_loss", False)),
         "backbone": getattr(args, "backbone", "efficientnet_b0"),
     }
-    (output_dir / "run_config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
+    (output_dir / "run_config.json").write_text(
+        json.dumps(config, indent=2), encoding="utf-8"
+    )
 
 
 def append_metrics_row(
@@ -1175,17 +1689,28 @@ def setup_logger(output_dir: Path) -> logging.Logger:
     return logger
 
 
-def build_model(heatmap_size: tuple[int, int], device: torch.device, rank: int, world_size: int,
-                backbone: str = "efficientnet_b0", use_offset_head: bool = False) -> nn.Module:
+def build_model(
+    heatmap_size: tuple[int, int],
+    device: torch.device,
+    rank: int,
+    world_size: int,
+    backbone: str = "efficientnet_b0",
+    use_offset_head: bool = False,
+    use_size_head: bool = False,
+    channels_last: bool = False,
+) -> nn.Module:
     # Rank 0 loads pretrained weights first so other ranks can reuse the local cache.
     if world_size > 1 and rank != 0:
         dist.barrier()
+    head_kwargs = {"use_offset_head": use_offset_head, "use_size_head": use_size_head}
     if backbone == "mobilenet_v3_small":
-        model = CCTagNetMobileV3(heatmap_size=heatmap_size, use_offset_head=use_offset_head).to(device)
+        model = CCTagNetMobileV3(heatmap_size=heatmap_size, **head_kwargs).to(device)
     elif backbone == "resnet18":
-        model = CCTagNetResNet18(heatmap_size=heatmap_size, use_offset_head=use_offset_head).to(device)
+        model = CCTagNetResNet18(heatmap_size=heatmap_size, **head_kwargs).to(device)
     else:
-        model = CCTagNet(heatmap_size=heatmap_size, use_offset_head=use_offset_head).to(device)
+        model = CCTagNet(heatmap_size=heatmap_size, **head_kwargs).to(device)
+    if channels_last:
+        model = model.to(memory_format=torch.channels_last)
     if world_size > 1 and rank == 0:
         dist.barrier()
     if world_size > 1:
@@ -1202,32 +1727,59 @@ def main() -> None:
     rank, world_size, _local_rank, device = setup_distributed(args)
     set_seed(args.seed + rank)
 
-    train_loader, val_loader, dataset_size, heatmap_size, train_sampler = create_dataloaders(
-        args,
-        rank=rank,
-        world_size=world_size,
+    use_amp = args.amp and device.type == "cuda"
+    if device.type == "cuda":
+        # Fixed input size -> cudnn can autotune the fastest conv kernels.
+        torch.backends.cudnn.benchmark = not args.no_cudnn_benchmark
+
+    train_loader, val_loader, dataset_size, heatmap_size, train_sampler = (
+        create_dataloaders(
+            args,
+            rank=rank,
+            world_size=world_size,
+        )
     )
     train_size = len(train_loader.dataset)
     val_size = len(val_loader.dataset)
 
     preview_batch(train_loader)
 
-    model = build_model(heatmap_size=heatmap_size, device=device, rank=rank, world_size=world_size,
-                        backbone=args.backbone, use_offset_head=args.offset_head)
+    model = build_model(
+        heatmap_size=heatmap_size,
+        device=device,
+        rank=rank,
+        world_size=world_size,
+        backbone=args.backbone,
+        use_offset_head=args.offset_head,
+        use_size_head=args.size_head,
+        channels_last=args.channels_last,
+    )
     if args.resume_from is not None:
         ckpt = torch.load(args.resume_from, map_location=device, weights_only=False)
-        state_dict = ckpt["model_state_dict"] if isinstance(ckpt, dict) and "model_state_dict" in ckpt else ckpt
+        state_dict = (
+            ckpt["model_state_dict"]
+            if isinstance(ckpt, dict) and "model_state_dict" in ckpt
+            else ckpt
+        )
         target = model.module if isinstance(model, DistributedDataParallel) else model
         missing, unexpected = target.load_state_dict(state_dict, strict=False)
         if is_main_process():
-            print(f"[resume] loaded weights from {args.resume_from} "
-                  f"(missing={len(missing)}, unexpected={len(unexpected)})")
+            print(
+                f"[resume] loaded weights from {args.resume_from} "
+                f"(missing={len(missing)}, unexpected={len(unexpected)})"
+            )
+    if args.compile_model:
+        # One-time graph capture + kernel fusion; fixed input size avoids recompiles.
+        model = torch.compile(model)
+        if is_main_process():
+            print("[compile] torch.compile enabled")
     criterion = CombinedHeatmapLoss(
         use_focal=args.focal_loss,
         focal_alpha=args.focal_alpha,
         focal_gamma=args.focal_gamma,
         ohem_ratio=args.ohem_ratio,
         offset_weight=args.offset_weight,
+        size_weight=args.size_weight,
     ).to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -1239,6 +1791,7 @@ def main() -> None:
         T_max=args.epochs,
         eta_min=1e-6,
     )
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
     write_run_config(
         output_dir=args.output_dir,
@@ -1251,7 +1804,11 @@ def main() -> None:
         world_size=world_size,
     )
     metrics_path = args.output_dir / "metrics.csv"
-    logger = setup_logger(args.output_dir) if is_main_process() else logging.getLogger("train")
+    logger = (
+        setup_logger(args.output_dir)
+        if is_main_process()
+        else logging.getLogger("train")
+    )
 
     best_val_loss = math.inf
     if is_main_process():
@@ -1267,13 +1824,24 @@ def main() -> None:
             train_sampler.set_epoch(epoch)
 
         start_time = time.time()
-        train_loss = train_one_epoch(model, train_loader, optimizer, criterion, device)
+        train_loss = train_one_epoch(
+            model,
+            train_loader,
+            optimizer,
+            criterion,
+            device,
+            scaler=scaler,
+            use_amp=use_amp,
+            channels_last=args.channels_last,
+        )
         val_metrics = validate(
             model,
             val_loader,
             criterion,
             device,
             input_size=(args.input_width, args.input_height),
+            use_amp=use_amp,
+            channels_last=args.channels_last,
         )
         scheduler.step()
         duration_sec = time.time() - start_time

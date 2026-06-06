@@ -31,6 +31,21 @@ IMAGENET_STD  = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(3,
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tiff"}
 
 
+def resolve_heatmap_path(directory: Path, stem: str) -> Path:
+    """Heatmap file for a stem, preferring compressed .npz over legacy .npy."""
+    npz = directory / f"{stem}.npz"
+    return npz if npz.exists() else directory / f"{stem}.npy"
+
+
+def load_heatmap(path: Path) -> np.ndarray:
+    """Load a heatmap stored as compressed .npz (key 'heatmap') or legacy .npy, as float32."""
+    path = Path(path)
+    if path.suffix == ".npz":
+        with np.load(path) as data:
+            return data["heatmap"].astype(np.float32)
+    return np.load(path).astype(np.float32)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="CCTagNet inference")
     parser.add_argument("--checkpoint", type=Path, required=True, help="Path to .pt checkpoint (best.pt / last.pt)")
@@ -109,13 +124,15 @@ def ensure_resnet18():
 
 
 class CCTagNet(nn.Module):
-    def __init__(self, heatmap_size: tuple[int, int], use_offset_head: bool = False) -> None:
+    def __init__(self, heatmap_size: tuple[int, int], use_offset_head: bool = False,
+                 use_size_head: bool = False) -> None:
         super().__init__()
         efficientnet_b0, EfficientNet_B0_Weights = ensure_torchvision()
         backbone = efficientnet_b0(weights=None)
         self.encoder = backbone.features
         self.heatmap_height, self.heatmap_width = heatmap_size
         self.use_offset_head = use_offset_head
+        self.use_size_head = use_size_head
         self.decoder = nn.Sequential(
             nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
             nn.Conv2d(1280, 256, kernel_size=3, padding=1), nn.BatchNorm2d(256), nn.ReLU(inplace=True),
@@ -128,7 +145,7 @@ class CCTagNet(nn.Module):
             nn.Conv2d(32, 1, kernel_size=1),
             nn.Sigmoid(),
         )
-        # NOTE: legacy CCTagNet has no separate feature tap; offset_head is unsupported here.
+        # NOTE: legacy CCTagNet has no separate feature tap; offset_head / size_head are unsupported here.
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         features = self.encoder(x)
@@ -198,13 +215,15 @@ class CCTagNetMobileV3(nn.Module):
     SKIP_INDICES = (0, 1, 3, 8)
     BOTTLENECK_CHANNELS = 576
 
-    def __init__(self, heatmap_size: tuple[int, int], use_offset_head: bool = False) -> None:
+    def __init__(self, heatmap_size: tuple[int, int], use_offset_head: bool = False,
+                 use_size_head: bool = False) -> None:
         super().__init__()
         mobilenet_v3_small, _ = ensure_mobilenet_v3_small()
         backbone = mobilenet_v3_small(weights=None)
         self.encoder = backbone.features
         self.heatmap_height, self.heatmap_width = heatmap_size
         self.use_offset_head = use_offset_head
+        self.use_size_head = use_size_head
 
         self.dec1 = self._dec_block(self.BOTTLENECK_CHANNELS + 48, 128)
         self.dec2 = self._dec_block(128 + 24, 64)
@@ -213,6 +232,8 @@ class CCTagNetMobileV3(nn.Module):
         self.head = nn.Sequential(nn.Conv2d(16, 1, kernel_size=1), nn.Sigmoid())
         if use_offset_head:
             self.offset_head = nn.Conv2d(16, 2, kernel_size=1)
+        if use_size_head:
+            self.size_head = nn.Conv2d(16, 2, kernel_size=1)
 
     @staticmethod
     def _dec_block(in_ch: int, out_ch: int) -> nn.Sequential:
@@ -237,7 +258,9 @@ class CCTagNetMobileV3(nn.Module):
             skip = nn.functional.interpolate(skip, size=x.shape[2:], mode="bilinear", align_corners=False)
         return torch.cat([x, skip], dim=1)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self, x: torch.Tensor
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
         bottleneck, (s16_s2, s16_s4, s24, s48) = self._encode(x)
         x = self.dec1(self._up_cat(bottleneck, s48))
         x = self.dec2(self._up_cat(x, s24))
@@ -248,12 +271,20 @@ class CCTagNetMobileV3(nn.Module):
             self.head(feat), size=(self.heatmap_height, self.heatmap_width),
             mode="bilinear", align_corners=False,
         )
+        offset = None
         if self.use_offset_head:
             offset = nn.functional.interpolate(
                 self.offset_head(feat), size=(self.heatmap_height, self.heatmap_width),
                 mode="bilinear", align_corners=False,
             )
-            return heatmap, offset
+        size = None
+        if self.use_size_head:
+            size = nn.functional.interpolate(
+                self.size_head(feat), size=(self.heatmap_height, self.heatmap_width),
+                mode="bilinear", align_corners=False,
+            )
+        if self.use_offset_head or self.use_size_head:
+            return heatmap, offset, size
         return heatmap
 
 
@@ -272,15 +303,18 @@ def load_model(checkpoint_path: Path, device: torch.device) -> tuple[nn.Module, 
     backbone = config.get("backbone", "efficientnet_b0")
     state = ckpt["model_state_dict"]
     use_offset_head = bool(config.get("use_offset_head", False)) or any(k.startswith("offset_head.") for k in state)
+    use_size_head = bool(config.get("use_size_head", False)) or any(k.startswith("size_head.") for k in state)
     config["use_offset_head"] = use_offset_head
+    config["use_size_head"] = use_size_head
+    head_kwargs = {"use_offset_head": use_offset_head, "use_size_head": use_size_head}
     if backbone == "mobilenet_v3_small":
-        model = CCTagNetMobileV3(heatmap_size=heatmap_size, use_offset_head=use_offset_head).to(device)
+        model = CCTagNetMobileV3(heatmap_size=heatmap_size, **head_kwargs).to(device)
     elif backbone == "resnet18":
-        model = CCTagNetResNet18(heatmap_size=heatmap_size, use_offset_head=use_offset_head).to(device)
+        model = CCTagNetResNet18(heatmap_size=heatmap_size, **head_kwargs).to(device)
     elif "dec1.0.weight" in state:
         model = CCTagNetV3(heatmap_size=heatmap_size).to(device)
     else:
-        model = CCTagNet(heatmap_size=heatmap_size, use_offset_head=use_offset_head).to(device)
+        model = CCTagNet(heatmap_size=heatmap_size, **head_kwargs).to(device)
     model.load_state_dict(state)
     model.eval()
     return model, config
@@ -365,6 +399,25 @@ def decode_center_offset(heatmap: np.ndarray, offset: np.ndarray, threshold: flo
     return float(px) + dx, float(py) + dy
 
 
+def decode_size_at_peak(
+    heatmap: np.ndarray, size_log: np.ndarray, threshold: float = 0.3
+) -> tuple[float, float] | None:
+    """Read (ellipse_a, ellipse_b) in source-image pixels from the size head.
+
+    The head outputs log(a), log(b); this returns exp of the prediction at the
+    heatmap argmax peak. Returns None when the peak is below threshold.
+    """
+    peak_val = float(heatmap.max())
+    if peak_val < threshold:
+        return None
+    h, w = heatmap.shape
+    flat_idx = int(np.argmax(heatmap))
+    py, px = divmod(flat_idx, w)
+    a_log = float(size_log[0, py, px])
+    b_log = float(size_log[1, py, px])
+    return float(np.exp(a_log)), float(np.exp(b_log))
+
+
 def decode_center_weighted(heatmap: np.ndarray, threshold: float = 0.3, radius: int = 2) -> tuple[float, float] | None:
     """Return (x, y) via weighted centroid around the peak. More robust than Hessian for smooth Gaussians."""
     peak_val = float(heatmap.max())
@@ -439,7 +492,8 @@ class CCTagNetResNet18(nn.Module):
     Bottleneck (layer4) → 512ch, stride 32
     """
 
-    def __init__(self, heatmap_size: tuple[int, int], use_offset_head: bool = False) -> None:
+    def __init__(self, heatmap_size: tuple[int, int], use_offset_head: bool = False,
+                 use_size_head: bool = False) -> None:
         super().__init__()
         resnet18, ResNet18_Weights = ensure_resnet18()
         backbone = resnet18(weights=None)
@@ -451,6 +505,7 @@ class CCTagNetResNet18(nn.Module):
         self.layer4 = backbone.layer4
         self.heatmap_height, self.heatmap_width = heatmap_size
         self.use_offset_head = use_offset_head
+        self.use_size_head = use_size_head
 
         self.dec1 = self._dec_block(512 + 256, 256)
         self.dec2 = self._dec_block(256 + 128, 128)
@@ -459,6 +514,8 @@ class CCTagNetResNet18(nn.Module):
         self.head = nn.Sequential(nn.Conv2d(32, 1, kernel_size=1), nn.Sigmoid())
         if use_offset_head:
             self.offset_head = nn.Conv2d(32, 2, kernel_size=1)
+        if use_size_head:
+            self.size_head = nn.Conv2d(32, 2, kernel_size=1)
 
     @staticmethod
     def _dec_block(in_ch: int, out_ch: int) -> nn.Sequential:
@@ -484,7 +541,9 @@ class CCTagNetResNet18(nn.Module):
         bottleneck = self.layer4(s256_s16)
         return bottleneck, (s64_s2, s64_s4, s128_s8, s256_s16)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self, x: torch.Tensor
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
         bottleneck, (s64_s2, s64_s4, s128_s8, s256_s16) = self._encode(x)
         x = self.dec1(self._up_cat(bottleneck, s256_s16))
         x = self.dec2(self._up_cat(x, s128_s8))
@@ -495,12 +554,20 @@ class CCTagNetResNet18(nn.Module):
             self.head(feat), size=(self.heatmap_height, self.heatmap_width),
             mode="bilinear", align_corners=False,
         )
+        offset = None
         if self.use_offset_head:
             offset = nn.functional.interpolate(
                 self.offset_head(feat), size=(self.heatmap_height, self.heatmap_width),
                 mode="bilinear", align_corners=False,
             )
-            return heatmap, offset
+        size = None
+        if self.use_size_head:
+            size = nn.functional.interpolate(
+                self.size_head(feat), size=(self.heatmap_height, self.heatmap_width),
+                mode="bilinear", align_corners=False,
+            )
+        if self.use_offset_head or self.use_size_head:
+            return heatmap, offset, size
         return heatmap
 
 
@@ -552,11 +619,13 @@ def load_ground_truth_map(dataset_dir: Path) -> dict[str, dict[str, Any]]:
             if not filename:
                 continue
             gt_map[filename] = {
-                "heatmap_path": heatmaps_dir / f"{filename}.npy",
+                "heatmap_path": resolve_heatmap_path(heatmaps_dir, filename),
                 "center_x": float(row.get("center_x") or row.get("x") or -1.0),
                 "center_y": float(row.get("center_y") or row.get("y") or -1.0),
                 "is_negative": int(row.get("is_negative") or 0) == 1,
                 "has_visible_marker": int(row.get("has_visible_marker") or 0) == 1,
+                "ellipse_a": float(row.get("ellipse_a") or 0.0),
+                "ellipse_b": float(row.get("ellipse_b") or 0.0),
             }
     return gt_map
 
@@ -652,7 +721,13 @@ def summarize_evaluation(
         print(f"saved per-image metrics: {per_image_path}")
 
 
-def save_overlay(image_path: Path, heatmap: np.ndarray, center_xy: tuple[float, float], out_path: Path) -> None:
+def save_overlay(
+    image_path: Path,
+    heatmap: np.ndarray,
+    center_xy: tuple[float, float],
+    out_path: Path,
+    size_ab: tuple[float, float] | None = None,
+) -> None:
     orig = cv2.imread(str(image_path))
     h, w = orig.shape[:2]
     hm_resized = cv2.resize(heatmap, (w, h))
@@ -664,6 +739,11 @@ def save_overlay(image_path: Path, heatmap: np.ndarray, center_xy: tuple[float, 
     hm_h, hm_w = heatmap.shape
     cx = int(center_xy[0] * w / hm_w)
     cy = int(center_xy[1] * h / hm_h)
+    if size_ab is not None:
+        a_px, b_px = size_ab
+        if a_px > 0 and b_px > 0:
+            axes = (max(int(round(a_px)), 1), max(int(round(b_px)), 1))
+            cv2.ellipse(overlay, (cx, cy), axes, 0.0, 0.0, 360.0, (0, 255, 255), 2)
     cv2.circle(overlay, (cx, cy), 6, (0, 255, 0), -1)
     cv2.circle(overlay, (cx, cy), 8, (0, 0, 0),   2)
 
@@ -742,7 +822,8 @@ def main() -> None:
     detection_log: list[dict[str, Any]] = []
 
     def _process_single(img_path: Path, heatmap: np.ndarray, heatmap_tensor: torch.Tensor,
-                        offset: np.ndarray | None = None) -> None:
+                        offset: np.ndarray | None = None,
+                        size_log: np.ndarray | None = None) -> None:
         """Post-process a single image: print result, save outputs, evaluate."""
         peak_val = float(heatmap.max())
         if offset is not None:
@@ -753,6 +834,10 @@ def main() -> None:
             result = decode_center_subpixel(heatmap, threshold=args.threshold)
         else:
             result = decode_center(heatmap, threshold=args.threshold)
+
+        size_ab: tuple[float, float] | None = None
+        if size_log is not None:
+            size_ab = decode_size_at_peak(heatmap, size_log, threshold=args.threshold)
 
         # Peak sharpness filter: reject diffuse broad activations
         sharpness = 0.0
@@ -778,6 +863,8 @@ def main() -> None:
                 "peak": peak_val,
                 "center_x_px": None,
                 "center_y_px": None,
+                "ellipse_a_px": None,
+                "ellipse_b_px": None,
             })
         else:
             cx_hm, cy_hm = result
@@ -786,19 +873,26 @@ def main() -> None:
             cx_px = cx_hm * orig_w / hm_w
             cy_px = cy_hm * orig_h / hm_h
             sharpness_str = f"  sharpness={sharpness:.2f}" if args.min_peak_sharpness > 0 else ""
-            print(f"{img_path.name}  center=({cx_px:.1f}, {cy_px:.1f})px  heatmap_peak=({cx_hm:.1f}, {cy_hm:.1f})  peak={peak_val:.3f}{sharpness_str}")
+            size_str = f"  ellipse=({size_ab[0]:.1f}, {size_ab[1]:.1f})px" if size_ab is not None else ""
+            print(
+                f"{img_path.name}  center=({cx_px:.1f}, {cy_px:.1f})px  "
+                f"heatmap_peak=({cx_hm:.1f}, {cy_hm:.1f})  peak={peak_val:.3f}"
+                f"{sharpness_str}{size_str}"
+            )
             detection_log.append({
                 "filename": img_path.name,
                 "detected": True,
                 "peak": peak_val,
                 "center_x_px": cx_px,
                 "center_y_px": cy_px,
+                "ellipse_a_px": size_ab[0] if size_ab is not None else None,
+                "ellipse_b_px": size_ab[1] if size_ab is not None else None,
             })
 
         if args.output:
             stem = img_path.stem
             if args.vis and result is not None:
-                save_overlay(img_path, heatmap, result, args.output / f"{stem}_overlay.png")
+                save_overlay(img_path, heatmap, result, args.output / f"{stem}_overlay.png", size_ab=size_ab)
 
         if gt_map is not None:
             stem = img_path.stem
@@ -812,7 +906,7 @@ def main() -> None:
                 print(f"{img_path.name}  warning: missing GT heatmap {gt_heatmap_path}, skipped evaluation")
                 return
 
-            gt_heatmap_raw = np.load(gt_heatmap_path).astype(np.float32)
+            gt_heatmap_raw = load_heatmap(gt_heatmap_path)
             gt_heatmap = resize_heatmap_to_shape(gt_heatmap_raw, heatmap.shape)
             gt_tensor = torch.from_numpy(gt_heatmap[None, None, ...]).to(device)
 
@@ -890,11 +984,15 @@ def main() -> None:
                     batch_out = model(batch_input)
             else:
                 batch_out = model(batch_input)
+            batch_offsets = None
+            batch_sizes = None
             if isinstance(batch_out, tuple):
-                batch_heatmaps, batch_offsets = batch_out
+                if len(batch_out) == 2:
+                    batch_heatmaps, batch_offsets = batch_out
+                else:
+                    batch_heatmaps, batch_offsets, batch_sizes = batch_out
             else:
                 batch_heatmaps = batch_out
-                batch_offsets = None
 
             for i, img_path in enumerate(batch_paths):
                 heatmap_tensor = batch_heatmaps[i : i + 1]  # (1, 1, H, W)
@@ -902,7 +1000,10 @@ def main() -> None:
                 offset_np: np.ndarray | None = None
                 if batch_offsets is not None:
                     offset_np = batch_offsets[i].float().cpu().numpy()  # (2, H, W)
-                _process_single(img_path, heatmap, heatmap_tensor.float(), offset_np)
+                size_np: np.ndarray | None = None
+                if batch_sizes is not None:
+                    size_np = batch_sizes[i].float().cpu().numpy()  # (2, H, W) log-space
+                _process_single(img_path, heatmap, heatmap_tensor.float(), offset_np, size_np)
 
     t_elapsed = time.perf_counter() - t_start
     n_images = len(image_paths)
@@ -929,7 +1030,13 @@ def main() -> None:
         detected_path.write_text("\n".join(d["filename"] for d in detected) + "\n", encoding="utf-8")
         not_detected_path.write_text("\n".join(d["filename"] for d in not_detected) + "\n", encoding="utf-8")
         with detection_csv.open("w", encoding="utf-8", newline="") as handle:
-            writer = csv.DictWriter(handle, fieldnames=["filename", "detected", "peak", "center_x_px", "center_y_px"])
+            writer = csv.DictWriter(
+                handle,
+                fieldnames=[
+                    "filename", "detected", "peak", "center_x_px", "center_y_px",
+                    "ellipse_a_px", "ellipse_b_px",
+                ],
+            )
             writer.writeheader()
             writer.writerows(detection_log)
         print(f"saved detected list:     {detected_path}")

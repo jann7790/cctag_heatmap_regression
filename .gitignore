@@ -43,3 +43,14 @@ ultimate_dataset/
 broken.png
 covered.png
 hoyilong.pdf
+40m_example.png
+
+# Model weights (large binaries — download separately)
+*.pt
+*.pth
+*.onnx
+
+# Downloaded archives and scratch files
+drive-download-*/
+nohup.out
+tmp.py
