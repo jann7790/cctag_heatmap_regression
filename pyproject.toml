@@ -3,13 +3,18 @@ requires = ["hatchling>=1.27.0"]
 build-backend = "hatchling.build"
 
 [project]
-name = "cctag-synthetic-workspace"
+name = "cctag-heatmap-regression"
 version = "0.1.0"
 description = "Synthetic CCTag dataset generation, training, and inference workspace."
 readme = "README.md"
-requires-python = "==3.12.11"
+# Loosened from ==3.12.11 so this can be a uv workspace member of `fso`
+# (requires-python ==3.10.*). The intersection inside that workspace is 3.10.*;
+# standalone it still resolves on newer 3.x. No 3.11/3.12-only syntax is used.
+requires-python = ">=3.10"
 dependencies = [
-    "numpy==2.4.3",
+    # Kept within fso's `>=2.0,<2.4` window so the shared workspace lockfile
+    # resolves (was pinned ==2.4.3, which fso excludes).
+    "numpy>=2.0,<2.4",
     "opencv-python==4.13.0.92",
 ]
 
@@ -41,14 +46,26 @@ conflicts = [
     ],
 ]
 
+# Index/source config mirrors fso's so the two pyprojects agree inside one
+# workspace (same index names must point at the same URLs). Standalone, this
+# repo resolves through the same mirrors.
+[[tool.uv.index]]
+name = "tsinghua"
+url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+default = true
+
+[[tool.uv.index]]
+name = "pypi"
+url = "https://pypi.org/simple"
+
 [[tool.uv.index]]
 name = "pytorch-cpu"
-url = "https://download.pytorch.org/whl/cpu"
+url = "https://mirror.sjtu.edu.cn/pytorch-wheels/cpu"
 explicit = true
 
 [[tool.uv.index]]
 name = "pytorch-cu126"
-url = "https://download.pytorch.org/whl/cu126"
+url = "https://mirror.sjtu.edu.cn/pytorch-wheels/cu126"
 explicit = true
 
 [tool.uv.sources]
