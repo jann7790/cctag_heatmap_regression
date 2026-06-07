@@ -306,6 +306,38 @@ uv run torchrun --nproc_per_node=4 src/train_cctag_heatmap_ddp.py \
 
 ## Test / Inference
 
+### ⚠️ 推論 / 評估不要依賴 `--amp`（fp16 定位陷阱）
+
+`--amp`（fp16 autocast）會嚴重破壞**中心定位精度**：收斂後 sigmoid 峰值會飽和成一整片 `1.0`，fp16 精度不足把這片區域全部四捨五入成相同的 `1.0`，`argmax` 遇到平手只能回傳最左上角那一格 → 預測中心被系統性往原點偏移 **約 14px**（在 1024×640 上）。
+
+特別陰險的是：這只影響**定位**，不影響**偵測率**（peak 仍超過 threshold），所以 detection rate 看起來完全正常，誤差卻悄悄被放大一倍以上。
+
+實測同一顆 checkpoint：
+
+| 模式 | center L2 mean | median |
+|------|---------------|--------|
+| fp32（正確） | ~6.5px | ~6.1px |
+| fp16（`--amp`） | ~15px | ~15px |
+
+處理方式（已內建）：
+
+- **推論**：`src/infer_cctag_heatmap.py` 的 forward 一律走 fp32；即使傳了 `--amp` 也會被忽略並印警告。`--amp` 已標記為 deprecated。
+- **訓練驗證**：`train_cctag_heatmap_ddp.py` 的 `validate()` 強制 fp32，所以 `metrics.csv` 的 `center_l2_px` 是真實值（不再被 fp16 灌水）。訓練的 forward/backward 仍可開 AMP 加速，**不影響權重品質**。
+
+> 規則：AMP 只用在「訓練加速」；任何「找峰值在哪一格」的定位 / evaluation 步驟都要用 fp32。
+
+### 誤差分佈統計
+
+`--eval` 會輸出中心誤差的 **mean / median / p90 / p95 / max**，並印出定位最差的 N 張（`--worst_n`，預設 20），同時存成 `worst_center_errors.csv`，方便判斷誤差是普遍偏移還是被少數離群值拉高。
+
+```bash
+uv run python src/infer_cctag_heatmap.py \
+  --checkpoint ./outputs/runs/experiment/best.pt \
+  --input ./outputs/real_world_stride4_test/images \
+  --dataset_dir ./outputs/real_world_stride4_test \
+  --output ./outputs/inference/eval --eval --worst_n 20
+```
+
 ### 正式 test
 
 訓練完成後，用 held-out `real_world_test` 做最終評估：

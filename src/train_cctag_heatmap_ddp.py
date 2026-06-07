@@ -244,7 +244,9 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Enable automatic mixed precision (fp16 autocast on the forward pass + "
         "GradScaler) on CUDA. ~1.5-2x faster and ~half the activation memory. The loss "
-        "is still computed in fp32 (BCELoss is unsafe under autocast).",
+        "is still computed in fp32 (BCELoss is unsafe under autocast). Only affects "
+        "the training forward/backward; validation always runs fp32 so center_l2_px is "
+        "not corrupted by the fp16 peak-plateau argmax bias.",
     )
     parser.add_argument(
         "--channels_last",
@@ -1448,8 +1450,11 @@ def validate(
         targets = batch["heatmap"].to(device, non_blocking=True)
         centers = batch["center"].to(device, non_blocking=True)
 
-        with torch.autocast(device_type=device.type, enabled=use_amp):
-            raw_out = model(images)
+        # Always run the validation forward in fp32: under fp16 autocast the sigmoid
+        # peak saturates to a flat plateau of identical 1.0 cells, so argmax decode
+        # snaps to the top-left of the plateau and inflates center_l2_px by ~10px.
+        # Validation is infrequent, so the fp32 cost is negligible.
+        raw_out = model(images)
         predictions, offset_pred, _size_pred = _split_pred(raw_out)
         predictions = predictions.float()
         offset_pred = offset_pred.float() if offset_pred is not None else None
@@ -1519,6 +1524,7 @@ def save_checkpoint(
     best_val_loss: float,
     args: argparse.Namespace,
     world_size: int,
+    heatmap_size: tuple[int, int],
 ) -> None:
     if not is_main_process():
         return
@@ -1538,6 +1544,10 @@ def save_checkpoint(
                 # Canonical head flags read by inference / benchmark.
                 "use_offset_head": bool(getattr(args, "offset_head", False)),
                 "use_size_head": bool(getattr(args, "size_head", False)),
+                # Heatmap output resolution, so inference rebuilds the model at the
+                # trained size instead of the (100, 160) fallback in load_model.
+                "heatmap_height": heatmap_size[0],
+                "heatmap_width": heatmap_size[1],
             },
         },
         checkpoint_path,
@@ -1718,6 +1728,11 @@ def build_model(
             model,
             device_ids=[device.index] if device.type == "cuda" else None,
             output_device=device.index if device.type == "cuda" else None,
+            # offset_head/size_head only contribute to the loss when a batch
+            # contains positive samples (see CombinedHeatmapLoss). An all-negative
+            # batch on any rank leaves those params gradient-less, which deadlocks
+            # the default reducer; let DDP detect and skip them per-iteration.
+            find_unused_parameters=(use_offset_head or use_size_head),
         )
     return model
 
@@ -1864,6 +1879,7 @@ def main() -> None:
             best_val_loss=best_val_loss,
             args=args,
             world_size=world_size,
+            heatmap_size=heatmap_size,
         )
 
         if epoch % args.save_every == 0:
@@ -1876,6 +1892,7 @@ def main() -> None:
                 best_val_loss=best_val_loss,
                 args=args,
                 world_size=world_size,
+                heatmap_size=heatmap_size,
             )
 
         if val_metrics["val_loss"] < best_val_loss:
@@ -1889,6 +1906,7 @@ def main() -> None:
                 best_val_loss=best_val_loss,
                 args=args,
                 world_size=world_size,
+                heatmap_size=heatmap_size,
             )
 
         if is_main_process():

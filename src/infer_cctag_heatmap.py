@@ -73,7 +73,7 @@ def parse_args() -> argparse.Namespace:
         help="Threshold used to binarize predicted/GT heatmaps for precision, recall, F1, and IoU.",
     )
     parser.add_argument("--compile", action="store_true", help="Use torch.compile() for faster inference (slow first run).")
-    parser.add_argument("--amp", action="store_true", help="Use AMP float16 for faster GPU inference.")
+    parser.add_argument("--amp", action="store_true", help="(Deprecated/ignored) fp16 corrupts center localization via peak-plateau argmax bias; inference always decodes in fp32.")
     parser.add_argument("--batch_size", type=int, default=1, help="Batch size for inference (default: 1).")
     parser.add_argument("--decode_method", type=str, default="weighted",
                         choices=["weighted", "subpixel", "argmax"],
@@ -88,6 +88,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--temporal_window", type=int, default=0,
                         help="Require detection in at least ceil(N*0.6) of the last N frames to accept. "
                              "Filters out sporadic single-frame false positives. 0 disables. Recommended: 5.")
+    parser.add_argument("--worst_n", type=int, default=20,
+                        help="In --eval mode, report the N worst-localized positives (highest center L2). "
+                             "Saved to worst_center_errors.csv. Default: 20.")
     return parser.parse_args()
 
 
@@ -647,6 +650,7 @@ def resize_heatmap_to_shape(heatmap: np.ndarray, shape_hw: tuple[int, int]) -> n
 def summarize_evaluation(
     rows: list[dict[str, Any]],
     output_dir: Path | None,
+    worst_n: int = 20,
 ) -> None:
     if not rows:
         print("evaluation: no matching ground-truth rows found")
@@ -682,7 +686,8 @@ def summarize_evaluation(
     det_f1 = safe_divide(2.0 * det_precision * det_recall, det_precision + det_recall)
     det_accuracy = safe_divide(tp_det + tn_det, tp_det + tn_det + fp_det + fn_det)
 
-    center_errors = [row["center_l2_px"] for row in rows if row["center_l2_px"] is not None]
+    center_rows = [row for row in rows if row["center_l2_px"] is not None]
+    center_errors = np.array([row["center_l2_px"] for row in center_rows], dtype=np.float64)
     metrics.update(
         {
             "heatmap_pixel_accuracy": accuracy,
@@ -694,9 +699,19 @@ def summarize_evaluation(
             "detection_precision": det_precision,
             "detection_recall": det_recall,
             "detection_f1": det_f1,
-            "mean_center_l2_px_on_detected_positives": float(np.mean(center_errors)) if center_errors else None,
+            "mean_center_l2_px_on_detected_positives": float(center_errors.mean()) if center_errors.size else None,
         }
     )
+    if center_errors.size:
+        metrics.update(
+            {
+                "center_l2_px_count": int(center_errors.size),
+                "center_l2_px_median": float(np.median(center_errors)),
+                "center_l2_px_p90": float(np.percentile(center_errors, 90)),
+                "center_l2_px_p95": float(np.percentile(center_errors, 95)),
+                "center_l2_px_max": float(center_errors.max()),
+            }
+        )
 
     print("\n=== evaluation summary ===")
     for key, value in metrics.items():
@@ -706,6 +721,13 @@ def summarize_evaluation(
             print(f"{key}: {value:.6f}")
         else:
             print(f"{key}: {value}")
+
+    # ── worst-localized positives (highest center L2) ─────────────────────────
+    worst_rows = sorted(center_rows, key=lambda r: r["center_l2_px"], reverse=True)[: max(worst_n, 0)]
+    if worst_rows:
+        print(f"\n=== worst {len(worst_rows)} center localizations (px) ===")
+        for r in worst_rows:
+            print(f"  {r['center_l2_px']:8.2f}px  peak={r['peak']:.3f}  {r['filename']}")
 
     if output_dir:
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -719,6 +741,18 @@ def summarize_evaluation(
             writer.writerows(rows)
         print(f"saved evaluation summary: {summary_path}")
         print(f"saved per-image metrics: {per_image_path}")
+        if worst_rows:
+            worst_path = output_dir / "worst_center_errors.csv"
+            with worst_path.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.DictWriter(
+                    handle, fieldnames=["filename", "center_l2_px", "peak"]
+                )
+                writer.writeheader()
+                writer.writerows(
+                    {"filename": r["filename"], "center_l2_px": r["center_l2_px"], "peak": r["peak"]}
+                    for r in worst_rows
+                )
+            print(f"saved worst center errors: {worst_path}")
 
 
 def save_overlay(
@@ -817,7 +851,14 @@ def main() -> None:
         dice_criterion = None
         eval_rows = []
 
-    use_amp = args.amp and device.type == "cuda"
+    # fp16 autocast saturates the sigmoid peak into a flat plateau of identical 1.0
+    # cells; argmax then snaps to the plateau's top-left corner, biasing the decoded
+    # center toward the origin by ~14px (detection rate is unaffected, so it hides
+    # easily). Localization must be decoded in fp32, so --amp is ignored here.
+    if args.amp and device.type == "cuda":
+        print("warning: --amp ignored for inference — fp16 corrupts center "
+              "localization (peak-plateau argmax bias). Running forward in fp32.")
+    use_amp = False
 
     detection_log: list[dict[str, Any]] = []
 
@@ -1044,7 +1085,7 @@ def main() -> None:
         print(f"saved detection log:     {detection_csv}")
 
     if gt_map is not None:
-        summarize_evaluation(eval_rows, args.output)
+        summarize_evaluation(eval_rows, args.output, worst_n=args.worst_n)
 
 
 if __name__ == "__main__":
