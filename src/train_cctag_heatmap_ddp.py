@@ -50,6 +50,12 @@ IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(3, 
 # negative rows where the value is 0 (those are masked out by the loss anyway).
 SIZE_TARGET_EPS = 1e-3
 
+# Ablation toggle for the decoder's bilinear up/down-sampling. PyTorch's default
+# (align_corners=False) shifts the sampling grid by a fraction of a pixel at each
+# interpolate stage; the cumulative effect is a candidate cause of the systematic
+# vertical center-decode bias. main() overrides this from --align_corners.
+DECODE_ALIGN_CORNERS = False
+
 
 def resolve_heatmap_path(directory: Path, stem: str) -> Path:
     """Heatmap file for a stem, preferring compressed .npz over legacy .npy."""
@@ -183,6 +189,14 @@ def parse_args() -> argparse.Namespace:
         default="resnet18",
         choices=["efficientnet_b0", "mobilenet_v3_small", "resnet18"],
         help="Backbone architecture (default: resnet18).",
+    )
+    parser.add_argument(
+        "--align_corners",
+        action="store_true",
+        help="Use align_corners=True in the decoder's bilinear interpolate stages "
+        "(ablation for the systematic vertical center-decode bias). Default: False "
+        "(PyTorch default). Changes spatial alignment, so checkpoints are not "
+        "interchangeable across this flag.",
     )
     parser.add_argument(
         "--focal_loss",
@@ -765,11 +779,11 @@ class CCTagNet(nn.Module):
     @staticmethod
     def _up_cat(x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
         x = nn.functional.interpolate(
-            x, scale_factor=2, mode="bilinear", align_corners=False
+            x, scale_factor=2, mode="bilinear", align_corners=DECODE_ALIGN_CORNERS
         )
         if x.shape[2:] != skip.shape[2:]:
             skip = nn.functional.interpolate(
-                skip, size=x.shape[2:], mode="bilinear", align_corners=False
+                skip, size=x.shape[2:], mode="bilinear", align_corners=DECODE_ALIGN_CORNERS
             )
         return torch.cat([x, skip], dim=1)
 
@@ -788,7 +802,7 @@ class CCTagNet(nn.Module):
             self.head(feat),
             size=(self.heatmap_height, self.heatmap_width),
             mode="bilinear",
-            align_corners=False,
+            align_corners=DECODE_ALIGN_CORNERS,
         )
         offset = None
         if self.use_offset_head:
@@ -796,7 +810,7 @@ class CCTagNet(nn.Module):
                 self.offset_head(feat),
                 size=(self.heatmap_height, self.heatmap_width),
                 mode="bilinear",
-                align_corners=False,
+                align_corners=DECODE_ALIGN_CORNERS,
             )
         size = None
         if self.use_size_head:
@@ -804,7 +818,7 @@ class CCTagNet(nn.Module):
                 self.size_head(feat),
                 size=(self.heatmap_height, self.heatmap_width),
                 mode="bilinear",
-                align_corners=False,
+                align_corners=DECODE_ALIGN_CORNERS,
             )
         if self.use_offset_head or self.use_size_head:
             return heatmap, offset, size
@@ -869,11 +883,11 @@ class CCTagNetMobileV3(nn.Module):
     @staticmethod
     def _up_cat(x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
         x = nn.functional.interpolate(
-            x, scale_factor=2, mode="bilinear", align_corners=False
+            x, scale_factor=2, mode="bilinear", align_corners=DECODE_ALIGN_CORNERS
         )
         if x.shape[2:] != skip.shape[2:]:
             skip = nn.functional.interpolate(
-                skip, size=x.shape[2:], mode="bilinear", align_corners=False
+                skip, size=x.shape[2:], mode="bilinear", align_corners=DECODE_ALIGN_CORNERS
             )
         return torch.cat([x, skip], dim=1)
 
@@ -890,7 +904,7 @@ class CCTagNetMobileV3(nn.Module):
             self.head(feat),
             size=(self.heatmap_height, self.heatmap_width),
             mode="bilinear",
-            align_corners=False,
+            align_corners=DECODE_ALIGN_CORNERS,
         )
         offset = None
         if self.use_offset_head:
@@ -898,7 +912,7 @@ class CCTagNetMobileV3(nn.Module):
                 self.offset_head(feat),
                 size=(self.heatmap_height, self.heatmap_width),
                 mode="bilinear",
-                align_corners=False,
+                align_corners=DECODE_ALIGN_CORNERS,
             )
         size = None
         if self.use_size_head:
@@ -906,7 +920,7 @@ class CCTagNetMobileV3(nn.Module):
                 self.size_head(feat),
                 size=(self.heatmap_height, self.heatmap_width),
                 mode="bilinear",
-                align_corners=False,
+                align_corners=DECODE_ALIGN_CORNERS,
             )
         if self.use_offset_head or self.use_size_head:
             return heatmap, offset, size
@@ -968,11 +982,11 @@ class CCTagNetResNet18(nn.Module):
     @staticmethod
     def _up_cat(x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
         x = nn.functional.interpolate(
-            x, scale_factor=2, mode="bilinear", align_corners=False
+            x, scale_factor=2, mode="bilinear", align_corners=DECODE_ALIGN_CORNERS
         )
         if x.shape[2:] != skip.shape[2:]:
             skip = nn.functional.interpolate(
-                skip, size=x.shape[2:], mode="bilinear", align_corners=False
+                skip, size=x.shape[2:], mode="bilinear", align_corners=DECODE_ALIGN_CORNERS
             )
         return torch.cat([x, skip], dim=1)
 
@@ -1002,7 +1016,7 @@ class CCTagNetResNet18(nn.Module):
             self.head(feat),
             size=(self.heatmap_height, self.heatmap_width),
             mode="bilinear",
-            align_corners=False,
+            align_corners=DECODE_ALIGN_CORNERS,
         )
         offset = None
         if self.use_offset_head:
@@ -1010,7 +1024,7 @@ class CCTagNetResNet18(nn.Module):
                 self.offset_head(feat),
                 size=(self.heatmap_height, self.heatmap_width),
                 mode="bilinear",
-                align_corners=False,
+                align_corners=DECODE_ALIGN_CORNERS,
             )
         size = None
         if self.use_size_head:
@@ -1018,7 +1032,7 @@ class CCTagNetResNet18(nn.Module):
                 self.size_head(feat),
                 size=(self.heatmap_height, self.heatmap_width),
                 mode="bilinear",
-                align_corners=False,
+                align_corners=DECODE_ALIGN_CORNERS,
             )
         if self.use_offset_head or self.use_size_head:
             return heatmap, offset, size
@@ -1596,6 +1610,7 @@ def write_run_config(
         "size_weight": float(getattr(args, "size_weight", 1.0)),
         "use_focal": bool(getattr(args, "focal_loss", False)),
         "backbone": getattr(args, "backbone", "efficientnet_b0"),
+        "align_corners": bool(getattr(args, "align_corners", False)),
     }
     (output_dir / "run_config.json").write_text(
         json.dumps(config, indent=2), encoding="utf-8"
@@ -1741,6 +1756,10 @@ def main() -> None:
     args = parse_args()
     rank, world_size, _local_rank, device = setup_distributed(args)
     set_seed(args.seed + rank)
+
+    # Apply the decoder align_corners ablation toggle before any model is built.
+    global DECODE_ALIGN_CORNERS
+    DECODE_ALIGN_CORNERS = bool(args.align_corners)
 
     use_amp = args.amp and device.type == "cuda"
     if device.type == "cuda":

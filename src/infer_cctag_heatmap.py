@@ -28,6 +28,12 @@ import torch.nn as nn
 IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(3, 1, 1)
 IMAGENET_STD  = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(3, 1, 1)
 
+# Decoder bilinear-resampling alignment. Must match the value the checkpoint was
+# trained with (training records it as config["align_corners"]); load_model sets
+# this from the checkpoint before building the model. Default False = legacy
+# behavior, so pre-existing checkpoints decode exactly as before.
+DECODE_ALIGN_CORNERS = False
+
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tiff"}
 
 
@@ -137,13 +143,13 @@ class CCTagNet(nn.Module):
         self.use_offset_head = use_offset_head
         self.use_size_head = use_size_head
         self.decoder = nn.Sequential(
-            nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
+            nn.Upsample(scale_factor=2, mode="bilinear", align_corners=DECODE_ALIGN_CORNERS),
             nn.Conv2d(1280, 256, kernel_size=3, padding=1), nn.BatchNorm2d(256), nn.ReLU(inplace=True),
-            nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
+            nn.Upsample(scale_factor=2, mode="bilinear", align_corners=DECODE_ALIGN_CORNERS),
             nn.Conv2d(256, 128, kernel_size=3, padding=1), nn.BatchNorm2d(128), nn.ReLU(inplace=True),
-            nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
+            nn.Upsample(scale_factor=2, mode="bilinear", align_corners=DECODE_ALIGN_CORNERS),
             nn.Conv2d(128,  64, kernel_size=3, padding=1), nn.BatchNorm2d(64),  nn.ReLU(inplace=True),
-            nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
+            nn.Upsample(scale_factor=2, mode="bilinear", align_corners=DECODE_ALIGN_CORNERS),
             nn.Conv2d( 64,  32, kernel_size=3, padding=1), nn.BatchNorm2d(32),  nn.ReLU(inplace=True),
             nn.Conv2d(32, 1, kernel_size=1),
             nn.Sigmoid(),
@@ -155,7 +161,7 @@ class CCTagNet(nn.Module):
         pred = self.decoder(features)
         return nn.functional.interpolate(
             pred, size=(self.heatmap_height, self.heatmap_width),
-            mode="bilinear", align_corners=False,
+            mode="bilinear", align_corners=DECODE_ALIGN_CORNERS,
         )
 
 
@@ -194,9 +200,9 @@ class CCTagNetV3(nn.Module):
 
     @staticmethod
     def _up_cat(x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
-        x = nn.functional.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False)
+        x = nn.functional.interpolate(x, scale_factor=2, mode="bilinear", align_corners=DECODE_ALIGN_CORNERS)
         if x.shape[2:] != skip.shape[2:]:
-            skip = nn.functional.interpolate(skip, size=x.shape[2:], mode="bilinear", align_corners=False)
+            skip = nn.functional.interpolate(skip, size=x.shape[2:], mode="bilinear", align_corners=DECODE_ALIGN_CORNERS)
         return torch.cat([x, skip], dim=1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -208,7 +214,7 @@ class CCTagNetV3(nn.Module):
         x = self.head(x)
         return nn.functional.interpolate(
             x, size=(self.heatmap_height, self.heatmap_width),
-            mode="bilinear", align_corners=False,
+            mode="bilinear", align_corners=DECODE_ALIGN_CORNERS,
         )
 
 
@@ -256,9 +262,9 @@ class CCTagNetMobileV3(nn.Module):
 
     @staticmethod
     def _up_cat(x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
-        x = nn.functional.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False)
+        x = nn.functional.interpolate(x, scale_factor=2, mode="bilinear", align_corners=DECODE_ALIGN_CORNERS)
         if x.shape[2:] != skip.shape[2:]:
-            skip = nn.functional.interpolate(skip, size=x.shape[2:], mode="bilinear", align_corners=False)
+            skip = nn.functional.interpolate(skip, size=x.shape[2:], mode="bilinear", align_corners=DECODE_ALIGN_CORNERS)
         return torch.cat([x, skip], dim=1)
 
     def forward(
@@ -272,19 +278,19 @@ class CCTagNetMobileV3(nn.Module):
         feat = x
         heatmap = nn.functional.interpolate(
             self.head(feat), size=(self.heatmap_height, self.heatmap_width),
-            mode="bilinear", align_corners=False,
+            mode="bilinear", align_corners=DECODE_ALIGN_CORNERS,
         )
         offset = None
         if self.use_offset_head:
             offset = nn.functional.interpolate(
                 self.offset_head(feat), size=(self.heatmap_height, self.heatmap_width),
-                mode="bilinear", align_corners=False,
+                mode="bilinear", align_corners=DECODE_ALIGN_CORNERS,
             )
         size = None
         if self.use_size_head:
             size = nn.functional.interpolate(
                 self.size_head(feat), size=(self.heatmap_height, self.heatmap_width),
-                mode="bilinear", align_corners=False,
+                mode="bilinear", align_corners=DECODE_ALIGN_CORNERS,
             )
         if self.use_offset_head or self.use_size_head:
             return heatmap, offset, size
@@ -302,6 +308,10 @@ def load_model(checkpoint_path: Path, device: torch.device) -> tuple[nn.Module, 
         # embed trusted Python objects such as pathlib.PosixPath in metadata.
         ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     config = ckpt.get("config", {})
+    # Match the decoder alignment the checkpoint was trained with before building
+    # the model (the legacy CCTagNet bakes nn.Upsample modules at construction).
+    global DECODE_ALIGN_CORNERS
+    DECODE_ALIGN_CORNERS = bool(config.get("align_corners", False))
     heatmap_size = (config.get("heatmap_height", 100), config.get("heatmap_width", 160))
     backbone = config.get("backbone", "efficientnet_b0")
     state = ckpt["model_state_dict"]
@@ -530,9 +540,9 @@ class CCTagNetResNet18(nn.Module):
 
     @staticmethod
     def _up_cat(x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
-        x = nn.functional.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False)
+        x = nn.functional.interpolate(x, scale_factor=2, mode="bilinear", align_corners=DECODE_ALIGN_CORNERS)
         if x.shape[2:] != skip.shape[2:]:
-            skip = nn.functional.interpolate(skip, size=x.shape[2:], mode="bilinear", align_corners=False)
+            skip = nn.functional.interpolate(skip, size=x.shape[2:], mode="bilinear", align_corners=DECODE_ALIGN_CORNERS)
         return torch.cat([x, skip], dim=1)
 
     def _encode(self, x: torch.Tensor) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
@@ -555,19 +565,19 @@ class CCTagNetResNet18(nn.Module):
         feat = x
         heatmap = nn.functional.interpolate(
             self.head(feat), size=(self.heatmap_height, self.heatmap_width),
-            mode="bilinear", align_corners=False,
+            mode="bilinear", align_corners=DECODE_ALIGN_CORNERS,
         )
         offset = None
         if self.use_offset_head:
             offset = nn.functional.interpolate(
                 self.offset_head(feat), size=(self.heatmap_height, self.heatmap_width),
-                mode="bilinear", align_corners=False,
+                mode="bilinear", align_corners=DECODE_ALIGN_CORNERS,
             )
         size = None
         if self.use_size_head:
             size = nn.functional.interpolate(
                 self.size_head(feat), size=(self.heatmap_height, self.heatmap_width),
-                mode="bilinear", align_corners=False,
+                mode="bilinear", align_corners=DECODE_ALIGN_CORNERS,
             )
         if self.use_offset_head or self.use_size_head:
             return heatmap, offset, size

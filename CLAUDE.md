@@ -32,6 +32,14 @@ uv run python src/generate_cctag_dataset.py --num_images 20 --seed 42 \
 uv run python src/visualize_random_labels.py --dataset_dir ./outputs/datasets/demo \
   --num_samples 10 --show_yolo_bbox --output ./outputs/tmp/demo_labels.jpg
 
+# Occlusion-augment a real-data ROI dataset (occluded positives only, in-frame markers only)
+uv run python src/augment_roi_occlusion.py \
+  --input_dir ./outputs/datasets/6f_labeled_1024x640_roi \
+  --output_dir ./outputs/datasets/6f_labeled_1024x640_roi_occ \
+  --variants_per_positive 2 --no-keep_clean --seed 42
+# (drops out-of-frame markers by default; pass --no-skip_out_of_frame to keep them,
+#  or --keep_clean to also copy the clean originals + negatives)
+
 # Train (DDP, multi-GPU)
 uv run torchrun --nproc_per_node=4 src/train_cctag_heatmap_ddp.py \
   --dataset_dir ./outputs/datasets/mixed --output_dir ./outputs/runs/experiment_ddp
@@ -60,8 +68,12 @@ All source files are **standalone CLI scripts** in `src/` -- there is no shared 
 | `infer_cctag_heatmap.py` | Inference with optional visualization and evaluation |
 | `benchmark.py` | Batch accuracy/latency benchmarking across models and test suites |
 | `visualize_random_labels.py` | Label QC grid visualization |
+| `sample_roi_dataset.py` | Sample rotated 1024x640 ROIs from a real labeled set (e.g. `6f_labeled`) into a heatmap training set |
+| `augment_roi_occlusion.py` | Add synthetic-occluder copies to a ROI dataset (reuses `apply_random_occlusion`); skips out-of-frame markers |
 
 Shell scripts in `scripts/` orchestrate multi-step workflows (generating training sets at different difficulty levels, merging datasets, running full generate-then-train pipelines).
+
+The real-data ROI pipeline (`sample_roi_dataset.py` → `augment_roi_occlusion.py`) and its design rationale are documented in `docs/roi_occlusion.md`.
 
 ## Dataset Output Contract
 

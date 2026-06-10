@@ -19,9 +19,10 @@ CUDA_VISIBLE_DEVICES=1 uv run python src/tile_detect.py \
 ```bash
 CUDA_VISIBLE_DEVICES=0 uv run python src/tile_heatmap.py \
   --checkpoint outputs/runs/heatmap_1024/best.pt \
-  --source 40m_example.png \
+  --source 1m.png \
   --output outputs/inference/hm1024_upgraded \
   --threshold 0.5 --min_peak_sharpness 3.0 --max_size_frac 1.2
+  # --source 40m_example.png \
 # offset head 出次像素圓心;min_peak_sharpness 砍鈍峰 FP;max_size_frac 砍超大尺寸 FP
 # --no_offset 可關 offset head(退回 argmax+拋物線)
 # tile 尺寸自動讀 checkpoint config 的 input_width/height (= 1024x640)
@@ -58,19 +59,21 @@ uv run python src/train_yolo_detection.py \
 
 ### CNN heatmap 1024 (offset+size head, 4-GPU)
 ```bash
-CUDA_VISIBLE_DEVICES=0,2,3,5 uv run torchrun --nproc_per_node=4 \
-  src/train_cctag_heatmap_ddp.py \
-  --dataset_dir outputs/training_sets/generated_training_sets_1024/mixed_train_dataset \
-  --input_width 1024 --input_height 640 \
-  --batch_size 20 \
-  --offset_head --size_head \
-  --focal_loss --focal_gamma 2.0 \
-  --output_dir outputs/runs/heatmap_1024
-# input_width/height 必須 = 生成的圖尺寸 (1024x640),否則會 resize 失去尺度對齊
-# 資料: scripts/generate_training_sets_1024.sh
-```
 
-
+CUDA_VISIBLE_DEVICES=0,2,3,5 uv run torchrun --nproc_per_node=4 src/train_cctag_heatmap_ddp.py \
+      --input_width 1024 --input_height 640 \
+      --train_dataset_dir ./outputs/training_sets/generated_training_sets_1024/mixed_train_dataset \
+      --train_dataset_dir ./outputs/datasets/6f_labeled_1024x640_roi \
+      --train_dataset_dir ./outputs/datasets/6f_labeled_1024x640_roi_occ_v2 \
+      --train_dataset_dir ./outputs/training_sets/real_world_merged_1024x640\
+      --train_dataset_dir ./outputs/datasets/hard_negative_random_20260608_230541_1024x640\
+      --train_dataset_dir ./outputs/datasets/hard_negative_random_20260608_231324_1024x640\
+      --train_dataset_dir ./outputs/datasets/hard_negative_random_20260608_231516_1024x640\
+      --output_dir ./outputs/runs/lower_l2_err \
+      --batch_size 20\
+      --offset_head --size_head \
+      --focal_loss --focal_gamma 2.0 \
+  ```
 ## TRAINING (older reference)
 
 ```bash
