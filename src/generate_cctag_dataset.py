@@ -388,6 +388,299 @@ def random_perspective_transform(
 # Occlusion Synthesis
 # ============================================================================
 
+def apply_hardware_occlusion(
+    img: np.ndarray,
+    center: tuple[float, float],
+    outer_radius: float,
+    target_ratio: float = 0.45,
+    edge_clutter_prob: float = 0.7,
+    shadow_prob: float = 0.85,
+) -> tuple[np.ndarray, float]:
+    """
+    Paint a realistic terminal-hardware occluder roughly centered on the marker.
+
+    Simulates the real FSO terminal hardware sitting in front of the marker:
+      - central mount bracket (dark gray, gradient shading)
+      - shiny collimator barrel above (specular metal, brighter than white)
+      - dark lens / galvo aperture with a bright rim
+      - horizontal clamp arm (long enough to cross the outer rings) with screws
+      - support post running down to the bottom of the frame
+      - lower clamp assembly covering the bottom arc of the rings
+      - peripheral blocks sitting on the outer rings (any azimuth)
+      - optional large clutter blobs entering from the frame edges
+      - soft drop shadow on the white target board
+
+    Args:
+        img: grayscale uint8 image.
+        center: (cx, cy) marker center in image coordinates.
+        outer_radius: FULL outer-ring radius of the marker in pixels.
+        target_ratio: desired occlusion ratio; controls the assembly scale.
+
+    Returns:
+        (occluded image uint8, actual occlusion ratio over the outer disc)
+    """
+    h, w = img.shape[:2]
+    # Work on a single luminance plane so the painting math is channel-agnostic;
+    # callers may pass grayscale (generator) or 3-channel BGR (ROI augmenter).
+    is_color = img.ndim == 3
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if is_color else img
+    out = gray.astype(np.float32).copy()
+    cx, cy = center
+    R = float(max(outer_radius, 12.0))
+
+    marker_mask = np.zeros((h, w), np.uint8)
+    cv2.circle(marker_mask, (int(round(cx)), int(round(cy))),
+               int(round(R)), 255, -1)
+
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    parts: list[tuple[np.ndarray, dict]] = []
+
+    def rot_rect(cx_, cy_, rw, rh, ang) -> np.ndarray:
+        m = np.zeros((h, w), np.uint8)
+        box = cv2.boxPoints(((float(cx_), float(cy_)),
+                             (float(max(rw, 2.0)), float(max(rh, 2.0))),
+                             float(ang)))
+        cv2.fillPoly(m, [np.round(box).astype(np.int32)], 255)
+        return m
+
+    def ellipse_mask(cx_, cy_, ra, rb, ang) -> np.ndarray:
+        m = np.zeros((h, w), np.uint8)
+        cv2.ellipse(m, (int(round(cx_)), int(round(cy_))),
+                    (int(max(ra, 2)), int(max(rb, 2))),
+                    float(ang), 0, 360, 255, -1)
+        return m
+
+    def add(mask: np.ndarray, **paint_kwargs) -> None:
+        if mask.any():
+            parts.append((mask, paint_kwargs))
+
+    # ------------------------------------------------------------------
+    # Assembly layout (tilted slightly, anchored near the marker center)
+    # ------------------------------------------------------------------
+    tilt = random.uniform(-14.0, 14.0)
+    rad = np.deg2rad(tilt)
+    ux, uy = float(np.sin(rad)), float(-np.cos(rad))   # assembly "up"
+    dnx, dny = -ux, -uy                                # assembly "down"
+
+    s = 0.7 + 0.8 * float(np.clip(target_ratio, 0.0, 1.0))
+    ax = cx + random.uniform(-0.12, 0.12) * R
+    ay = cy + random.uniform(-0.08, 0.12) * R
+
+    # 1) central mount bracket -----------------------------------------
+    blk_w = random.uniform(0.55, 0.80) * R * s
+    blk_h = random.uniform(0.40, 0.58) * R * s
+    add(rot_rect(ax, ay, blk_w, blk_h, tilt),
+        base=random.uniform(38, 85), grad_axis="y",
+        grad_amp=random.uniform(15, 32),
+        spec=((ax - blk_w * 0.2, ay - blk_h * 0.2,
+               blk_w * 0.35, blk_h * 0.30, random.uniform(25, 70))
+              if random.random() < 0.7 else None),
+        noise_std=7.0)
+
+    # extra bracket plate for heavy occlusion
+    if target_ratio > 0.55 and random.random() < 0.8:
+        ex = ax + random.uniform(-0.25, 0.25) * R
+        ey = ay + dny * random.uniform(0.25, 0.45) * R
+        add(rot_rect(ex, ey, blk_w * random.uniform(0.7, 1.0),
+                     blk_h * random.uniform(0.7, 1.0),
+                     tilt + random.uniform(-10, 10)),
+            base=random.uniform(45, 95), grad_axis="x",
+            grad_amp=random.uniform(12, 28), noise_std=7.0)
+
+    # 2) shiny collimator barrel above the bracket ---------------------
+    bar_len = random.uniform(0.60, 1.00) * R * s
+    bar_w = random.uniform(0.18, 0.28) * R * s
+    bx = ax + ux * (blk_h * 0.5 + bar_len * 0.45)
+    by = ay + uy * (blk_h * 0.5 + bar_len * 0.45)
+    add(rot_rect(bx, by, bar_w, bar_len, tilt),
+        base=random.uniform(120, 165), grad_axis="x",
+        grad_amp=random.uniform(15, 35),
+        # strong vertical specular stripe -> brighter than marker white
+        spec=(bx, by, bar_w * 0.22, bar_len * 0.8, random.uniform(70, 120)),
+        noise_std=6.0)
+    # bright end cap
+    if random.random() < 0.7:
+        tx = ax + ux * (blk_h * 0.5 + bar_len * 0.92)
+        ty = ay + uy * (blk_h * 0.5 + bar_len * 0.92)
+        add(ellipse_mask(tx, ty, bar_w * 0.55, bar_w * 0.35, tilt),
+            base=random.uniform(180, 230), grad_axis="y",
+            grad_amp=10.0, noise_std=4.0, ao=False)
+
+    # 3) dark lens / galvo aperture with bright rim --------------------
+    if random.random() < 0.8:
+        side = random.choice([-1.0, 1.0])
+        lx = ax + side * random.uniform(0.18, 0.32) * R * s
+        ly = ay + random.uniform(-0.12, 0.10) * R * s
+        lr = random.uniform(0.12, 0.20) * R * s
+        add(ellipse_mask(lx, ly, lr, lr * random.uniform(0.85, 1.0), tilt),
+            base=random.uniform(12, 32), grad_axis="y",
+            grad_amp=8.0, noise_std=4.0, ao=False)
+        rim = np.zeros((h, w), np.uint8)
+        cv2.ellipse(rim, (int(round(lx)), int(round(ly))),
+                    (int(max(lr, 2)), int(max(lr * 0.92, 2))),
+                    float(tilt), random.uniform(0, 180),
+                    random.uniform(260, 360) + 90, 255,
+                    max(int(lr * 0.18), 1))
+        add(rim, base=random.uniform(160, 220), grad_axis="x",
+            grad_amp=10.0, noise_std=4.0, ao=False)
+
+    # 4) horizontal clamp arm with screws ------------------------------
+    # long enough to run across the outer rings, like the real rail/clamp
+    if random.random() < 0.9:
+        side = random.choice([-1.0, 1.0])
+        arm_w = random.uniform(1.30, 2.20) * R * s
+        arm_h = random.uniform(0.22, 0.36) * R * s
+        axc = ax + side * (blk_w * 0.5 + arm_w * 0.30)
+        ayc = ay + random.uniform(0.10, 0.45) * R * s
+        add(rot_rect(axc, ayc, arm_w, arm_h,
+                     tilt + random.uniform(-8, 8)),
+            base=random.uniform(70, 120), grad_axis="x",
+            grad_amp=random.uniform(12, 25), noise_std=6.0)
+        for _ in range(random.randint(1, 3)):
+            sx = axc + random.uniform(-0.35, 0.35) * arm_w
+            sy = ayc + random.uniform(-0.25, 0.25) * arm_h
+            sr = max(0.035 * R * s, 1.5)
+            add(ellipse_mask(sx, sy, sr, sr, 0),
+                base=random.uniform(150, 220), grad_axis="y",
+                grad_amp=0.0, noise_std=3.0, ao=False)
+
+    # 5) support post running down to the bottom edge ------------------
+    if random.random() < 0.85:
+        post_w = random.uniform(0.30, 0.55) * R * s
+        post_len = (h - ay) * 1.1 + 0.3 * R
+        px = ax + dnx * post_len * 0.5
+        py = ay + dny * post_len * 0.5
+        add(rot_rect(px, py, post_w, post_len, tilt),
+            base=random.uniform(55, 105), grad_axis="x",
+            grad_amp=random.uniform(15, 30),
+            spec=(px, py, post_w * 0.25, post_len,
+                  random.uniform(20, 60)),
+            noise_std=6.0)
+
+    # 5b) lower clamp assembly covering the bottom arc of the rings ----
+    # (the chunky rail/holder visible at the bottom of the real captures)
+    if random.random() < 0.85:
+        low_w = random.uniform(1.20, 2.00) * R * s
+        low_h = random.uniform(0.45, 0.80) * R * s
+        lyc = ay + dny * random.uniform(0.75, 1.10) * R
+        lxc = ax + dnx * 0.0 + random.uniform(-0.30, 0.30) * R
+        add(rot_rect(lxc, lyc, low_w, low_h,
+                     tilt + random.uniform(-8, 8)),
+            base=random.uniform(45, 100), grad_axis="y",
+            grad_amp=random.uniform(15, 30),
+            spec=((lxc, lyc - low_h * 0.25, low_w * 0.30,
+                   low_h * 0.25, random.uniform(20, 60))
+                  if random.random() < 0.6 else None),
+            noise_std=7.0)
+        # screws / knobs on the clamp
+        for _ in range(random.randint(1, 3)):
+            sx = lxc + random.uniform(-0.38, 0.38) * low_w
+            sy = lyc + random.uniform(-0.28, 0.28) * low_h
+            sr = max(random.uniform(0.04, 0.07) * R * s, 1.5)
+            add(ellipse_mask(sx, sy, sr, sr, 0),
+                base=random.uniform(140, 215), grad_axis="y",
+                grad_amp=0.0, noise_std=3.0, ao=False)
+
+    # 5c) peripheral blocks sitting on the outer rings ------------------
+    n_peri = random.randint(1, 3)
+    for _ in range(n_peri):
+        ang = random.uniform(0, 2 * np.pi)
+        dist = random.uniform(0.55, 1.00) * R
+        pxc = cx + np.cos(ang) * dist
+        pyc = cy + np.sin(ang) * dist
+        pw = random.uniform(0.35, 0.75) * R * s
+        ph = random.uniform(0.30, 0.60) * R * s
+        add(rot_rect(pxc, pyc, pw, ph,
+                     tilt + random.uniform(-25, 25)),
+            base=random.uniform(35, 110),
+            grad_axis=random.choice(["x", "y"]),
+            grad_amp=random.uniform(12, 30), noise_std=7.0)
+
+    # 6) clutter blobs entering from the frame edges -------------------
+    # Kept modest so a single blob cannot blanket a tight ROI crop where the
+    # marker fills much of the frame (the coverage cap in the augmenter is the
+    # final guard, but small blobs keep retries rare).
+    if random.random() < edge_clutter_prob:
+        for _ in range(random.randint(1, 2)):
+            edge = random.choice(["left", "right", "bottom", "top"])
+            cw = random.uniform(0.12, 0.28) * w
+            ch = random.uniform(0.12, 0.28) * h
+            if edge == "left":
+                exc, eyc = 0.0, random.uniform(0, h)
+            elif edge == "right":
+                exc, eyc = float(w), random.uniform(0, h)
+            elif edge == "top":
+                exc, eyc = random.uniform(0, w), 0.0
+            else:
+                exc, eyc = random.uniform(0, w), float(h)
+            add(rot_rect(exc, eyc, cw, ch, random.uniform(-20, 20)),
+                base=random.uniform(18, 60),
+                grad_axis=random.choice(["x", "y"]),
+                grad_amp=random.uniform(10, 30), noise_std=8.0)
+
+    if not parts:
+        return img, 0.0
+
+    # ------------------------------------------------------------------
+    # Soft drop shadow on the target board, then paint parts on top
+    # ------------------------------------------------------------------
+    union = np.zeros((h, w), np.uint8)
+    for m, _ in parts:
+        union = cv2.bitwise_or(union, m)
+
+    if random.random() < shadow_prob:
+        ksz = max(int(R * 0.12) | 1, 3)
+        dil = cv2.dilate(union, np.ones((ksz, ksz), np.uint8))
+        sh = cv2.GaussianBlur(dil.astype(np.float32) / 255.0,
+                              (0, 0), max(R * 0.08, 2.0))
+        out *= (1.0 - sh * random.uniform(0.15, 0.35))
+
+    occ_total = np.zeros((h, w), np.uint8)
+
+    def _paint(mask, base, grad_axis="y", grad_amp=20.0, spec=None,
+               noise_std=5.0, ao=True):
+        sel = mask > 0
+        ys, xs = np.nonzero(sel)
+        y0, y1 = ys.min(), ys.max()
+        x0, x1 = xs.min(), xs.max()
+        if grad_axis == "x":
+            t = (xx - x0) / max(x1 - x0, 1)
+        else:
+            t = (yy - y0) / max(y1 - y0, 1)
+        layer = base + grad_amp * (t - 0.5) * 2.0
+        if spec is not None:
+            sxc, syc, sgx, sgy, st = spec
+            layer = layer + st * np.exp(
+                -((xx - sxc) ** 2 / (2 * max(sgx, 1.0) ** 2)
+                  + (yy - syc) ** 2 / (2 * max(sgy, 1.0) ** 2)))
+        layer = layer + np.random.randn(h, w).astype(np.float32) * noise_std
+        if ao:
+            # fake ambient occlusion: darken toward the part edges
+            dist = cv2.distanceTransform(mask, cv2.DIST_L2, 3)
+            edge = np.clip(dist / 6.0, 0.0, 1.0)
+            layer = layer * (0.55 + 0.45 * edge)
+        out[sel] = np.clip(layer[sel], 0, 255)
+        occ_total[sel] = 255
+
+    for m, kw in parts:
+        _paint(m, **kw)
+
+    # soften occluder boundaries (real optics never give razor edges)
+    k3 = np.ones((3, 3), np.uint8)
+    band = cv2.dilate(occ_total, k3) - cv2.erode(occ_total, k3)
+    blurred = cv2.GaussianBlur(out, (3, 3), 0)
+    out[band > 0] = blurred[band > 0]
+
+    marker_pixels = max(int(np.count_nonzero(marker_mask)), 1)
+    occluded = int(np.count_nonzero((marker_mask > 0) & (occ_total > 0)))
+    ratio = min(occluded / marker_pixels, 1.0)
+
+    result = np.clip(out, 0, 255).astype(np.uint8)
+    if is_color:
+        result = cv2.cvtColor(result, cv2.COLOR_GRAY2BGR)
+    return result, ratio
+
+
 def apply_random_occlusion(
     img: np.ndarray,
     center: tuple[float, float],
@@ -426,6 +719,15 @@ def apply_random_occlusion(
 
     if target_ratio < 0.02:
         return img, 0.0
+
+    if occlusion_style in ("hardware", "mixed"):
+        if occlusion_style == "hardware" or random.random() < 0.6:
+            # marker_radius here is HALF the true outer-ring radius in render
+            # space (render_marker_radius = marker_radius * 2), so pass *2.0.
+            return apply_hardware_occlusion(
+                img, center, marker_radius * 2.0, target_ratio=target_ratio
+            )
+        # "mixed" falls through to the existing synthetic occluders
 
     img = img.copy()
     cx, cy = center
@@ -1933,8 +2235,12 @@ def main():
     parser.add_argument("--occ_max", type=float, default=0.6,
                         help="Max occlusion ratio (default: 0.6)")
     parser.add_argument("--occlusion_style", type=str, default="standard",
-                        choices=["standard", "aggressive", "center_heavy"],
-                        help="Occlusion pattern style. 'aggressive' and 'center_heavy' create thick center-crossing blockers.")
+                        choices=["standard", "aggressive", "center_heavy",
+                                 "hardware", "mixed"],
+                        help="Occlusion pattern style. 'aggressive'/'center_heavy' create thick "
+                             "center-crossing blockers; 'hardware' paints a realistic FSO-terminal "
+                             "occluder (bracket/barrel/clamp/post) covering center + outer rings; "
+                             "'mixed' uses hardware 60%% of the time, else the synthetic occluders.")
     parser.add_argument("--partial_out_prob", type=float, default=0.25,
                         help="Probability of placing a marker partially outside the frame (default: 0.25)")
     parser.add_argument("--partial_out_max_ratio", type=float, default=0.35,

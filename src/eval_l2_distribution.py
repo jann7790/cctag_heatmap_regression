@@ -96,7 +96,11 @@ def main() -> None:
     ndx: list[float] = []
     ndy: list[float] = []
     srcs: list[str] = []
+    peaks: list[float] = []
+    edge_flags: list[bool] = []
+    sizes: list[float] = []
     idx_ptr = 0
+    edge_margin = 8.0  # px from image border counts as an "edge / out-of-frame" marker
     with torch.no_grad():
         for batch in loader:
             bsz = batch["image"].size(0)
@@ -127,6 +131,10 @@ def main() -> None:
             d = torch.linalg.norm(dec_px - centers[pos], dim=1)
             errs.extend(d.cpu().tolist())
             occ.extend(batch["occlusion_ratio"][pos.cpu()].cpu().tolist())
+            # marker size: ellipse_a in source px = exp(size_target[:,0])
+            sizes.extend(
+                torch.exp(batch["size_target"][pos.cpu(), 0]).cpu().tolist()
+            )
             diff = (dec_px - centers[pos]).cpu().numpy()
             dxs.extend(diff[:, 0].tolist())
             dys.extend(diff[:, 1].tolist())
@@ -139,6 +147,11 @@ def main() -> None:
             ndy.extend(nd[:, 1].tolist())
             pos_np = pos.cpu().numpy()
             srcs.extend([s for s, keep in zip(batch_src, pos_np) if keep])
+            peaks.extend(pred[pos].flatten(1).max(dim=1).values.cpu().tolist())
+            cpx = centers[pos].cpu().numpy()
+            ex = (cpx[:, 0] <= edge_margin) | (cpx[:, 0] >= input_size[0] - 1 - edge_margin)
+            ey = (cpx[:, 1] <= edge_margin) | (cpx[:, 1] >= input_size[1] - 1 - edge_margin)
+            edge_flags.extend((ex | ey).tolist())
             # control: decode the GT heatmap (no offset) vs the CSV center, same scale.
             gt_dec = T.decode_heatmap_centers(targets[pos], offsets=None)
             gt_dec[:, 0] *= sx
@@ -199,6 +212,7 @@ def main() -> None:
         f"{'source':<42s} {'n':>5s} {'dx_med':>8s} {'dy_med':>8s} "
         f"{'dx_mean':>8s} {'dy_mean':>8s} {'L2_med':>8s}"
     )
+    edge_arr = np.array(edge_flags, dtype=bool)
     for name in dict.fromkeys(srcs):  # preserve order, unique
         m = sarr == name
         print(
@@ -206,6 +220,40 @@ def main() -> None:
             f"{np.median(dx[m]):+8.2f} {np.median(dy[m]):+8.2f} "
             f"{dx[m].mean():+8.2f} {dy[m].mean():+8.2f} {np.median(e[m]):8.2f}"
         )
+        mi = m & ~edge_arr  # interior-only, isolates genuine annotation bias from edge artifacts
+        if mi.any():
+            print(
+                f"  {'(interior only)':<40s} {int(mi.sum()):5d} "
+                f"{np.median(dx[mi]):+8.2f} {np.median(dy[mi]):+8.2f} "
+                f"{dx[mi].mean():+8.2f} {dy[mi].mean():+8.2f} {np.median(e[mi]):8.2f}"
+            )
+
+    pk = np.array(peaks)
+    edge = np.array(edge_flags, dtype=bool)
+    det = pk >= 0.5
+    print("\n-- detection / edge breakdown --")
+    print(
+        f"all positives:        n={e.size:5d}  mean={e.mean():7.3f}  "
+        f"median={np.median(e):6.3f}"
+    )
+    if det.any():
+        print(
+            f"detected (peak>=0.5): n={int(det.sum()):5d}  mean={e[det].mean():7.3f}  "
+            f"median={np.median(e[det]):6.3f}   <-- what the fixed metric reports"
+        )
+    nd_mask = ~det
+    if nd_mask.any():
+        print(
+            f"undetected (peak<0.5):n={int(nd_mask.sum()):5d}  "
+            f"(folded into old mean as spurious huge L2; {int((edge & nd_mask).sum())} are edge markers)"
+        )
+    for tag, m in (("interior", ~edge), ("edge(<8px)", edge)):
+        if m.any():
+            print(
+                f"{tag:<22s}n={int(m.sum()):5d}  mean={e[m].mean():7.3f}  "
+                f"median={np.median(e[m]):6.3f}  "
+                f"detected_mean={e[m & det].mean() if (m & det).any() else float('nan'):7.3f}"
+            )
 
     if o.size and o.max() > 0:
         print("\n-- mean L2 by occlusion bin --")
@@ -215,6 +263,20 @@ def main() -> None:
                 tag = "clean" if hi <= 1e-6 else f"{lo:.1f}-{hi:.1f}"
                 print(
                     f"occ {tag:>9s}: n={int(m.sum()):5d}  "
+                    f"mean={e[m].mean():6.2f}  median={np.median(e[m]):6.2f}"
+                )
+
+    sz = np.array(sizes)
+    if sz.size:
+        print("\n-- L2 by marker size (ellipse_a, source px) --")
+        # small markers suffer most from heatmap discretization -> stride-2 should
+        # help them most; this isolates where the gain lands.
+        for lo, hi in [(0, 60), (60, 100), (100, 160), (160, 280), (280, 1e9)]:
+            m = (sz >= lo) & (sz < hi)
+            if m.any():
+                label = f"{lo:>4g}-{hi:<4g}" if hi < 1e9 else f">{lo:g}"
+                print(
+                    f"a {label:>11s}: n={int(m.sum()):5d}  "
                     f"mean={e[m].mean():6.2f}  median={np.median(e[m]):6.2f}"
                 )
 

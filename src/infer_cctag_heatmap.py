@@ -324,6 +324,8 @@ def load_model(checkpoint_path: Path, device: torch.device) -> tuple[nn.Module, 
         model = CCTagNetMobileV3(heatmap_size=heatmap_size, **head_kwargs).to(device)
     elif backbone == "resnet18":
         model = CCTagNetResNet18(heatmap_size=heatmap_size, **head_kwargs).to(device)
+    elif backbone == "resnet18_hires":
+        model = CCTagNetResNet18HiRes(heatmap_size=heatmap_size, **head_kwargs).to(device)
     elif "dec1.0.weight" in state:
         model = CCTagNetV3(heatmap_size=heatmap_size).to(device)
     else:
@@ -562,6 +564,99 @@ class CCTagNetResNet18(nn.Module):
         x = self.dec2(self._up_cat(x, s128_s8))
         x = self.dec3(self._up_cat(x, s64_s4))
         x = self.dec4(self._up_cat(x, s64_s2))
+        feat = x
+        heatmap = nn.functional.interpolate(
+            self.head(feat), size=(self.heatmap_height, self.heatmap_width),
+            mode="bilinear", align_corners=DECODE_ALIGN_CORNERS,
+        )
+        offset = None
+        if self.use_offset_head:
+            offset = nn.functional.interpolate(
+                self.offset_head(feat), size=(self.heatmap_height, self.heatmap_width),
+                mode="bilinear", align_corners=DECODE_ALIGN_CORNERS,
+            )
+        size = None
+        if self.use_size_head:
+            size = nn.functional.interpolate(
+                self.size_head(feat), size=(self.heatmap_height, self.heatmap_width),
+                mode="bilinear", align_corners=DECODE_ALIGN_CORNERS,
+            )
+        if self.use_offset_head or self.use_size_head:
+            return heatmap, offset, size
+        return heatmap
+
+
+class CCTagNetResNet18HiRes(nn.Module):
+    """Inference-side mirror of the training CCTagNetResNet18HiRes.
+
+    ResNet-18 encoder with the stem maxpool dropped (2x finer pyramid,
+    bottleneck stride 16) and a double-conv U-Net decoder. Structure must match
+    the training class exactly so checkpoints load.
+
+    Skip taps (conv1 keeps stride 2, maxpool removed):
+        layer1 -> 64ch,  stride 2
+        layer2 -> 128ch, stride 4
+        layer3 -> 256ch, stride 8
+    Bottleneck (layer4) -> 512ch, stride 16
+    """
+
+    def __init__(self, heatmap_size: tuple[int, int], use_offset_head: bool = False,
+                 use_size_head: bool = False) -> None:
+        super().__init__()
+        resnet18, ResNet18_Weights = ensure_resnet18()
+        backbone = resnet18(weights=None)
+        self.stem = nn.Sequential(backbone.conv1, backbone.bn1, backbone.relu)
+        # backbone.maxpool intentionally dropped to keep early resolution.
+        self.layer1 = backbone.layer1
+        self.layer2 = backbone.layer2
+        self.layer3 = backbone.layer3
+        self.layer4 = backbone.layer4
+        self.heatmap_height, self.heatmap_width = heatmap_size
+        self.use_offset_head = use_offset_head
+        self.use_size_head = use_size_head
+
+        self.dec1 = self._dec_block(512 + 256, 256)
+        self.dec2 = self._dec_block(256 + 128, 128)
+        self.dec3 = self._dec_block(128 + 64, 64)
+        self.head = nn.Sequential(nn.Conv2d(64, 1, kernel_size=1), nn.Sigmoid())
+        if use_offset_head:
+            self.offset_head = nn.Conv2d(64, 2, kernel_size=1)
+        if use_size_head:
+            self.size_head = nn.Conv2d(64, 2, kernel_size=1)
+
+    @staticmethod
+    def _dec_block(in_ch: int, out_ch: int) -> nn.Sequential:
+        return nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+        )
+
+    @staticmethod
+    def _up_cat(x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
+        x = nn.functional.interpolate(x, scale_factor=2, mode="bilinear", align_corners=DECODE_ALIGN_CORNERS)
+        if x.shape[2:] != skip.shape[2:]:
+            skip = nn.functional.interpolate(skip, size=x.shape[2:], mode="bilinear", align_corners=DECODE_ALIGN_CORNERS)
+        return torch.cat([x, skip], dim=1)
+
+    def _encode(self, x: torch.Tensor) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
+        s_stem = self.stem(x)
+        s64_s2 = self.layer1(s_stem)
+        s128_s4 = self.layer2(s64_s2)
+        s256_s8 = self.layer3(s128_s4)
+        bottleneck = self.layer4(s256_s8)
+        return bottleneck, (s64_s2, s128_s4, s256_s8)
+
+    def forward(
+        self, x: torch.Tensor
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+        bottleneck, (s64_s2, s128_s4, s256_s8) = self._encode(x)
+        x = self.dec1(self._up_cat(bottleneck, s256_s8))
+        x = self.dec2(self._up_cat(x, s128_s4))
+        x = self.dec3(self._up_cat(x, s64_s2))
         feat = x
         heatmap = nn.functional.interpolate(
             self.head(feat), size=(self.heatmap_height, self.heatmap_width),

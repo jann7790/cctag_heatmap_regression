@@ -168,8 +168,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--save_every",
         type=int,
-        default=1,
-        help="Save a checkpoint every N epochs in addition to best/last.",
+        default=10,
+        help="Save a numbered epoch_NNN.pt checkpoint every N epochs (best.pt and "
+        "last.pt are always updated every epoch regardless).",
     )
     parser.add_argument(
         "--backend",
@@ -187,8 +188,16 @@ def parse_args() -> argparse.Namespace:
         "--backbone",
         type=str,
         default="resnet18",
-        choices=["efficientnet_b0", "mobilenet_v3_small", "resnet18"],
-        help="Backbone architecture (default: resnet18).",
+        choices=[
+            "efficientnet_b0",
+            "mobilenet_v3_small",
+            "resnet18",
+            "resnet18_hires",
+        ],
+        help="Backbone architecture (default: resnet18). 'resnet18_hires' drops "
+        "the stem maxpool (2x finer encoder) and uses a double-conv decoder for "
+        "sub-pixel localization; its checkpoints are not interchangeable with "
+        "'resnet18'.",
     )
     parser.add_argument(
         "--align_corners",
@@ -234,6 +243,14 @@ def parse_args() -> argparse.Namespace:
         help="Weight of the offset L1 loss term. Default: 1.0.",
     )
     parser.add_argument(
+        "--occ_loss_weight",
+        type=float,
+        default=0.0,
+        help="Per-sample heatmap-loss weighting by occlusion: weight = 1 + k*occ_ratio "
+        "(mean-normalized, so overall loss scale is unchanged). Focuses learning on "
+        "hard-occluded markers. Default: 0.0 (off). Try 1.0 for gentle weighting.",
+    )
+    parser.add_argument(
         "--size_head",
         action="store_true",
         help="Add a 2-channel size head that regresses log(ellipse_a), log(ellipse_b) "
@@ -264,9 +281,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--channels_last",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help="Use channels_last memory format for the model and inputs (faster conv on "
-        "Tensor Cores). Numerically equivalent.",
+        "Tensor Cores). Numerically equivalent. ON by default; disable with "
+        "--no-channels_last.",
     )
     parser.add_argument(
         "--compile",
@@ -280,6 +299,14 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Disable cudnn.benchmark autotuning. It is ON by default here because the "
         "input size is fixed; turn off only for strict determinism.",
+    )
+    parser.add_argument(
+        "--tf32",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Allow the TF32 Tensor Core path for conv/matmul on Ampere+ GPUs "
+        "(fp32 accumulate; effectively lossless for CNN training). ON by default; "
+        "disable with --no-tf32.",
     )
     # --- online augmentation (Tier 3): OFF unless --augment ---
     parser.add_argument(
@@ -623,6 +650,7 @@ class CombinedHeatmapLoss(nn.Module):
         ohem_ratio: float = 0.0,
         offset_weight: float = 1.0,
         size_weight: float = 1.0,
+        occ_weight_k: float = 0.0,
     ) -> None:
         super().__init__()
         if use_focal:
@@ -635,6 +663,10 @@ class CombinedHeatmapLoss(nn.Module):
         self.ohem_ratio = ohem_ratio
         self.offset_weight = offset_weight
         self.size_weight = size_weight
+        # Per-sample heatmap-loss weighting by occlusion: w = 1 + k * occ_ratio,
+        # mean-normalized so the overall loss scale (hence effective LR) is
+        # unchanged. k=0 disables it. Focuses learning on hard-occluded markers.
+        self.occ_weight_k = occ_weight_k
 
     def _pixel_term(
         self, prediction: torch.Tensor, target: torch.Tensor
@@ -647,6 +679,41 @@ class CombinedHeatmapLoss(nn.Module):
             return topk_loss.mean()
         return self.pixel_loss(prediction, target)
 
+    def _weighted_heatmap_term(
+        self,
+        prediction: torch.Tensor,
+        target: torch.Tensor,
+        occlusion_ratio: torch.Tensor,
+    ) -> torch.Tensor:
+        """Per-sample 0.5*pixel + 0.5*dice, weighted by (1 + k*occ_ratio).
+
+        Weights are mean-normalized so the batch loss scale (and effective LR)
+        match the unweighted path; only the relative emphasis changes.
+        """
+        eps = 1e-7
+        pred = prediction.clamp(eps, 1.0 - eps)
+        if self.use_focal:
+            bce = -(target * torch.log(pred) + (1.0 - target) * torch.log(1.0 - pred))
+            pt = target * pred + (1.0 - target) * (1.0 - pred)
+            focal_weight = (1.0 - pt) ** self.pixel_loss.gamma
+            alpha_weight = (
+                target * self.pixel_loss.alpha
+                + (1.0 - target) * (1.0 - self.pixel_loss.alpha)
+            )
+            px = (alpha_weight * focal_weight * bce).flatten(1).mean(dim=1)  # (B,)
+        else:
+            px = nn.functional.binary_cross_entropy(
+                pred, target, reduction="none"
+            ).flatten(1).mean(dim=1)
+        p2, t2 = prediction.flatten(1), target.flatten(1)
+        inter = (p2 * t2).sum(dim=1)
+        den = p2.sum(dim=1) + t2.sum(dim=1)
+        dice = 1.0 - (2.0 * inter + self.dice.smooth) / (den + self.dice.smooth)  # (B,)
+        per_sample = 0.5 * px + 0.5 * dice
+        w = 1.0 + self.occ_weight_k * occlusion_ratio
+        w = w / w.mean().clamp(min=eps)
+        return (w * per_sample).mean()
+
     def forward(
         self,
         prediction: torch.Tensor,
@@ -655,30 +722,50 @@ class CombinedHeatmapLoss(nn.Module):
         offset_pred: torch.Tensor | None = None,
         size_pred: torch.Tensor | None = None,
         size_target: torch.Tensor | None = None,
+        occlusion_ratio: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        heatmap_loss = 0.5 * self._pixel_term(prediction, target) + 0.5 * self.dice(
-            prediction, target
-        )
+        if self.occ_weight_k > 0.0 and occlusion_ratio is not None:
+            heatmap_loss = self._weighted_heatmap_term(
+                prediction, target, occlusion_ratio
+            )
+        else:
+            heatmap_loss = 0.5 * self._pixel_term(prediction, target) + 0.5 * self.dice(
+                prediction, target
+            )
         total = heatmap_loss
 
-        # Sub-pixel offset L1 loss (CenterNet-style): supervise offset only at the GT peak,
-        # only on positive samples. Offset target = heatmap_center - round(heatmap_center).
+        # Sub-pixel offset L1 loss (CenterNet-style), positives only. Supervise the
+        # offset over a 3x3 neighborhood around the GT peak (not just round(center)):
+        # at inference the decoder reads offset at the argmax peak, which need not
+        # equal round(center), so the single-pixel target left those cells
+        # unsupervised. Each neighbor cell predicts (heatmap_center - its own int
+        # coord); out-of-bounds neighbors are masked out.
         if offset_pred is not None and heatmap_centers is not None:
             pos_mask = target.flatten(1).max(dim=1).values > 0.1
             if pos_mask.any():
-                centers_pos = heatmap_centers[pos_mask]  # (P, 2)
+                centers_pos = heatmap_centers[pos_mask]  # (P, 2) [x, y]
                 offset_pos = offset_pred[pos_mask]  # (P, 2, H, W)
-                _, _, H, W = offset_pos.shape
-                peak_int = centers_pos.round().long()
-                peak_int[:, 0].clamp_(0, W - 1)
-                peak_int[:, 1].clamp_(0, H - 1)
-                offset_target = centers_pos - peak_int.float()  # (P, 2) in [-0.5, 0.5]
-                p_idx = torch.arange(offset_pos.shape[0], device=offset_pos.device)
-                offset_at_peak = offset_pos[
-                    p_idx, :, peak_int[:, 1], peak_int[:, 0]
-                ]  # (P, 2)
+                P, _, H, W = offset_pos.shape
+                peak_int = centers_pos.round().long()  # (P, 2) [x, y]
+                p_idx = torch.arange(P, device=offset_pos.device)
+                preds: list[torch.Tensor] = []
+                tgts: list[torch.Tensor] = []
+                for ddy in (-1, 0, 1):
+                    for ddx in (-1, 0, 1):
+                        nx = peak_int[:, 0] + ddx
+                        ny = peak_int[:, 1] + ddy
+                        valid = (nx >= 0) & (nx < W) & (ny >= 0) & (ny < H)
+                        if not valid.any():
+                            continue
+                        nxv = nx[valid]
+                        nyv = ny[valid]
+                        preds.append(offset_pos[p_idx[valid], :, nyv, nxv])  # (V, 2)
+                        tgts.append(
+                            centers_pos[valid]
+                            - torch.stack((nxv, nyv), dim=1).float()
+                        )
                 offset_loss = nn.functional.smooth_l1_loss(
-                    offset_at_peak, offset_target
+                    torch.cat(preds), torch.cat(tgts)
                 )
                 total = total + self.offset_weight * offset_loss
 
@@ -1039,6 +1126,126 @@ class CCTagNetResNet18(nn.Module):
         return heatmap
 
 
+class CCTagNetResNet18HiRes(nn.Module):
+    """ResNet-18 encoder (stem maxpool dropped) with a higher-capacity decoder.
+
+    Variant of CCTagNetResNet18 aimed at sub-pixel center localization. Dropping
+    the stem maxpool keeps the encoder pyramid 2x finer (bottleneck stride 16
+    instead of 32), so the precise peak location is not discarded by the early
+    max-pool; the decoder uses double-conv blocks (two 3x3 convs per stage) so it
+    has the capacity to exploit the finer skips. The final decoder feature stays
+    at stride 2 and the output heatmap resolution is unchanged (set by
+    heatmap_size) -- this deliberately isolates "finer encoder + bigger decoder"
+    from the already-tried (and worse) finer-output-heatmap experiment.
+
+    Skip taps (conv1 keeps stride 2, maxpool removed):
+        layer1 -> 64ch,  stride 2
+        layer2 -> 128ch, stride 4
+        layer3 -> 256ch, stride 8
+    Bottleneck (layer4) -> 512ch, stride 16
+    """
+
+    def __init__(
+        self,
+        heatmap_size: tuple[int, int],
+        use_offset_head: bool = False,
+        use_size_head: bool = False,
+    ) -> None:
+        super().__init__()
+        resnet18, ResNet18_Weights = ensure_resnet18()
+        backbone = resnet18(weights=ResNet18_Weights.DEFAULT)
+        self.stem = nn.Sequential(
+            backbone.conv1,
+            backbone.bn1,
+            backbone.relu,
+        )
+        # backbone.maxpool is intentionally dropped to keep early resolution.
+        self.layer1 = backbone.layer1
+        self.layer2 = backbone.layer2
+        self.layer3 = backbone.layer3
+        self.layer4 = backbone.layer4
+        self.heatmap_height, self.heatmap_width = heatmap_size
+        self.use_offset_head = use_offset_head
+        self.use_size_head = use_size_head
+
+        self.dec1 = self._dec_block(512 + 256, 256)
+        self.dec2 = self._dec_block(256 + 128, 128)
+        self.dec3 = self._dec_block(128 + 64, 64)
+        self.head = nn.Sequential(nn.Conv2d(64, 1, kernel_size=1), nn.Sigmoid())
+        if use_offset_head:
+            self.offset_head = nn.Conv2d(64, 2, kernel_size=1)
+        if use_size_head:
+            self.size_head = nn.Conv2d(64, 2, kernel_size=1)
+
+    @staticmethod
+    def _dec_block(in_ch: int, out_ch: int) -> nn.Sequential:
+        # Double conv: more decoder capacity than the single-conv block in
+        # CCTagNetResNet18, so the finer encoder skips can actually be used.
+        return nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+        )
+
+    @staticmethod
+    def _up_cat(x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
+        x = nn.functional.interpolate(
+            x, scale_factor=2, mode="bilinear", align_corners=DECODE_ALIGN_CORNERS
+        )
+        if x.shape[2:] != skip.shape[2:]:
+            skip = nn.functional.interpolate(
+                skip, size=x.shape[2:], mode="bilinear", align_corners=DECODE_ALIGN_CORNERS
+            )
+        return torch.cat([x, skip], dim=1)
+
+    def _encode(
+        self, x: torch.Tensor
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        s_stem = self.stem(x)  # stride 2, 64ch
+        s64_s2 = self.layer1(s_stem)  # stride 2, 64ch (no maxpool)
+        s128_s4 = self.layer2(s64_s2)  # stride 4, 128ch
+        s256_s8 = self.layer3(s128_s4)  # stride 8, 256ch
+        bottleneck = self.layer4(s256_s8)  # stride 16, 512ch
+        return bottleneck, (s64_s2, s128_s4, s256_s8)
+
+    def forward(
+        self, x: torch.Tensor
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+        bottleneck, (s64_s2, s128_s4, s256_s8) = self._encode(x)
+        x = self.dec1(self._up_cat(bottleneck, s256_s8))
+        x = self.dec2(self._up_cat(x, s128_s4))
+        x = self.dec3(self._up_cat(x, s64_s2))
+        feat = x
+        heatmap = nn.functional.interpolate(
+            self.head(feat),
+            size=(self.heatmap_height, self.heatmap_width),
+            mode="bilinear",
+            align_corners=DECODE_ALIGN_CORNERS,
+        )
+        offset = None
+        if self.use_offset_head:
+            offset = nn.functional.interpolate(
+                self.offset_head(feat),
+                size=(self.heatmap_height, self.heatmap_width),
+                mode="bilinear",
+                align_corners=DECODE_ALIGN_CORNERS,
+            )
+        size = None
+        if self.use_size_head:
+            size = nn.functional.interpolate(
+                self.size_head(feat),
+                size=(self.heatmap_height, self.heatmap_width),
+                mode="bilinear",
+                align_corners=DECODE_ALIGN_CORNERS,
+            )
+        if self.use_offset_head or self.use_size_head:
+            return heatmap, offset, size
+        return heatmap
+
+
 def split_dataset(
     dataset: Dataset[Any], train_ratio: float, seed: int
 ) -> tuple[Subset[Any], Subset[Any]]:
@@ -1306,7 +1513,20 @@ def compute_center_distance_sum(
     target_centers_px: torch.Tensor,
     input_size: tuple[int, int],
     offsets: torch.Tensor | None = None,
+    peak_threshold: float = 0.5,
 ) -> tuple[float, int]:
+    # Only score localization on positives the model actually detected
+    # (pred peak >= threshold). Undetected positives are false negatives and are
+    # already reflected in positive_detection_rate; folding their argmax of a
+    # near-zero heatmap into the L2 produces spurious hundreds-of-px errors that
+    # dominate the mean (see eval_l2_distribution.py tail analysis).
+    detected = prediction.flatten(1).max(dim=1).values >= peak_threshold
+    if not detected.any():
+        return 0.0, 0
+    prediction = prediction[detected]
+    target_centers_px = target_centers_px[detected]
+    if offsets is not None:
+        offsets = offsets[detected]
     pred_centers = decode_heatmap_centers(prediction, offsets=offsets)
     input_width, input_height = input_size
     heatmap_height, heatmap_width = prediction.shape[-2:]
@@ -1402,6 +1622,9 @@ def train_one_epoch(
         size_target = batch.get("size_target")
         if size_target is not None:
             size_target = size_target.to(device, non_blocking=True)
+        occlusion_ratio = batch.get("occlusion_ratio")
+        if occlusion_ratio is not None:
+            occlusion_ratio = occlusion_ratio.to(device, non_blocking=True)
 
         optimizer.zero_grad(set_to_none=True)
         # autocast only wraps the forward pass; the loss is computed in fp32 because
@@ -1419,6 +1642,7 @@ def train_one_epoch(
             offset_pred=offset_pred,
             size_pred=size_pred,
             size_target=size_target if size_pred is not None else None,
+            occlusion_ratio=occlusion_ratio,
         )
         if scaler is not None and scaler.is_enabled():
             scaler.scale(loss).backward()
@@ -1732,6 +1956,10 @@ def build_model(
         model = CCTagNetMobileV3(heatmap_size=heatmap_size, **head_kwargs).to(device)
     elif backbone == "resnet18":
         model = CCTagNetResNet18(heatmap_size=heatmap_size, **head_kwargs).to(device)
+    elif backbone == "resnet18_hires":
+        model = CCTagNetResNet18HiRes(heatmap_size=heatmap_size, **head_kwargs).to(
+            device
+        )
     else:
         model = CCTagNet(heatmap_size=heatmap_size, **head_kwargs).to(device)
     if channels_last:
@@ -1765,6 +1993,12 @@ def main() -> None:
     if device.type == "cuda":
         # Fixed input size -> cudnn can autotune the fastest conv kernels.
         torch.backends.cudnn.benchmark = not args.no_cudnn_benchmark
+        # TF32 Tensor Core path for conv/matmul: 10-bit-mantissa multiply with
+        # fp32 accumulate. Speeds up Ampere+ GPUs at accuracy that is effectively
+        # lossless for CNN training (and the coordinate decode is elementwise, not
+        # matmul, so it stays full fp32). Disable with --no-tf32 for strict repro.
+        torch.backends.cuda.matmul.allow_tf32 = args.tf32
+        torch.backends.cudnn.allow_tf32 = args.tf32
 
     train_loader, val_loader, dataset_size, heatmap_size, train_sampler = (
         create_dataloaders(
@@ -1814,6 +2048,7 @@ def main() -> None:
         ohem_ratio=args.ohem_ratio,
         offset_weight=args.offset_weight,
         size_weight=args.size_weight,
+        occ_weight_k=args.occ_loss_weight,
     ).to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(),

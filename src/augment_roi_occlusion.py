@@ -12,15 +12,15 @@ center label and the existing heatmap stay valid (the model keeps learning to
 regress the center under occlusion). Only ``occlusion_ratio`` is updated to the
 measured coverage. Negatives are never occluded.
 
-By default (``--realistic``) the flat geometric occluder from
-``apply_random_occlusion`` is dressed up to match the real rig (see
-``capture_20260608_*.png``): curved cables crossing the marker, bright metallic
-glints on the occluder, and feathered / motion-blurred edges. Pass
-``--no-realistic`` for the legacy flat-dark-block behaviour.
+The default ``--occlusion_style hardware`` paints a realistic FSO-terminal
+occluder (mount bracket, shiny collimator barrel, clamp arm, support post, and
+blocks sitting on the outer rings) centered on the marker, matching the real rig
+(see ``capture_20260608_*.png``). ``apply_hardware_occlusion`` already renders
+gradient shading, specular highlights, a soft drop shadow and feathered edges,
+so no extra post-processing is applied.
 
-Tiers mirror ``scripts/generate_training_sets.sh`` (occlusion_style=aggressive
-for all): variants alternate between a low/partial range and a hard range, so
-half the occluded copies are partial and half are heavy.
+Tiers control the occluder scale: variants alternate between a low/partial range
+and a hard range, so half the occluded copies are partial and half are heavy.
 
 The source dataset is never modified; the output goes to a fresh directory and
 is drop-in compatible with ``src/train_cctag_heatmap_ddp.py`` (images/,
@@ -131,306 +131,6 @@ def copy_clean(stem: str, in_dir: Path, out_dir: Path) -> None:
         dst_txt.write_text("")
 
 
-# --------------------------------------------------------------------------- #
-# Realism post-processing
-#
-# apply_random_occlusion() paints flat dark geometric blocks. Real captures
-# (see capture_20260608_*.png) show the marker occluded by a metal/printed
-# mount with specular highlights, thin curved cables, soft/motion-blurred
-# edges. These helpers add those cues on top of the geometric occluder so the
-# augmented occlusion matches the real rig more closely.
-# --------------------------------------------------------------------------- #
-
-def occluder_mask_from_diff(before: np.ndarray, after: np.ndarray) -> np.ndarray:
-    """Binary mask (uint8 0/255) of pixels apply_random_occlusion changed."""
-    diff = np.abs(after.astype(np.int16) - before.astype(np.int16)).sum(axis=2)
-    return ((diff > 8).astype(np.uint8)) * 255
-
-
-def _bezier_points(p0: np.ndarray, p1: np.ndarray, p2: np.ndarray, n: int = 48) -> np.ndarray:
-    """Quadratic Bezier polyline as an int32 (n, 2) point array for cv2."""
-    t = np.linspace(0.0, 1.0, n)[:, None]
-    pts = (1 - t) ** 2 * p0 + 2 * (1 - t) * t * p1 + t ** 2 * p2
-    return np.round(pts).astype(np.int32)
-
-
-def _cubic_bezier_points(p0: np.ndarray, p1: np.ndarray, p2: np.ndarray, p3: np.ndarray, n: int = 64) -> np.ndarray:
-    """Cubic Bezier polyline as an int32 (n, 2) point array for cv2."""
-    t = np.linspace(0.0, 1.0, n)[:, None]
-    pts = (1 - t) ** 3 * p0 + 3 * (1 - t) ** 2 * t * p1 + 3 * (1 - t) * t ** 2 * p2 + t ** 3 * p3
-    return np.round(pts).astype(np.int32)
-
-
-def draw_cables(img: np.ndarray, mask: np.ndarray, cx: float, cy: float, r: float,
-                rng: random.Random, n_cables: int) -> None:
-    """Draw curved 3D-shaded cables crossing the marker, updating the occluder mask.
-
-    Uses cubic Bezier curves to allow S-curves. Renders cables using multi-layer
-    drawing (base, shadow, light sheen, specular glint) to create a realistic
-    3D cylindrical appearance.
-    """
-    center = np.array([cx, cy], dtype=np.float64)
-
-    for _ in range(n_cables):
-        # 1. Generate cubic Bezier path crossing the marker area
-        span = r * rng.uniform(2.2, 3.8)
-        ang0 = rng.uniform(0.0, 2 * math.pi)
-        ang3 = ang0 + rng.uniform(math.pi * 0.6, math.pi * 1.4)
-
-        p0 = center + span * np.array([math.cos(ang0), math.sin(ang0)])
-        p3 = center + span * np.array([math.cos(ang3), math.sin(ang3)])
-
-        # Midpoint close to center to ensure occlusion
-        ang_mid = rng.uniform(0.0, 2 * math.pi)
-        p_mid = center + r * rng.uniform(0.0, 0.8) * np.array([math.cos(ang_mid), math.sin(ang_mid)])
-
-        # Control points
-        d0 = np.linalg.norm(p_mid - p0)
-        d3 = np.linalg.norm(p_mid - p3)
-
-        p1 = p0 + (p_mid - p0) * rng.uniform(0.4, 0.7)
-        p2 = p3 + (p_mid - p3) * rng.uniform(0.4, 0.7)
-
-        # Add some perpendicular perturbation to control points for S-curves
-        perp0 = np.array([-(p_mid[1] - p0[1]), p_mid[0] - p0[0]]) / (d0 + 1e-6)
-        perp3 = np.array([-(p_mid[1] - p3[1]), p_mid[0] - p3[0]]) / (d3 + 1e-6)
-
-        p1 += perp0 * rng.uniform(-0.5, 0.5) * r
-        p2 += perp3 * rng.uniform(-0.5, 0.5) * r
-
-        pts = _cubic_bezier_points(p0, p1, p2, p3)
-
-        # 2. Cable properties
-        thick = int(max(4, rng.uniform(0.06, 0.20) * r))
-
-        # Muted colors: mostly black/dark-grey, occasionally industrial yellow, blue, or green
-        color_type = rng.choice(["grey", "grey", "grey", "yellow", "blue", "green"])
-        if color_type == "grey":
-            g = rng.randint(20, 55)
-            base_bgr = np.array([g, g, g], dtype=np.float32)
-        elif color_type == "yellow":
-            # Industrial yellow/orange: high R & G, low B
-            base_bgr = np.array([rng.randint(20, 45), rng.randint(90, 140), rng.randint(110, 160)], dtype=np.float32)
-        elif color_type == "blue":
-            # Muted blue: high B, lower R & G
-            base_bgr = np.array([rng.randint(100, 150), rng.randint(60, 95), rng.randint(40, 75)], dtype=np.float32)
-        else: # green
-            # Industrial green/teal
-            base_bgr = np.array([rng.randint(60, 95), rng.randint(90, 130), rng.randint(40, 70)], dtype=np.float32)
-
-        # Draw base cable
-        cv2.polylines(img, [pts], False, base_bgr.astype(np.uint8).tolist(), thick, cv2.LINE_AA)
-        cv2.polylines(mask, [pts], False, 255, thick, cv2.LINE_AA)
-
-        # 3. 3D shading layers
-        # Light direction for cable highlight offset
-        light_ang = rng.uniform(0.0, 2 * math.pi)
-        ldx = math.cos(light_ang)
-        ldy = math.sin(light_ang)
-
-        # Shadow side (offset in direction of light_ang + pi)
-        sh_thick = max(1, int(thick * 0.75))
-        sh_offset = np.array([-ldx, -ldy]) * rng.uniform(0.5, 1.5)
-        pts_sh = (pts + sh_offset).astype(np.int32)
-        sh_color = (base_bgr * 0.55).astype(np.uint8).tolist()
-        cv2.polylines(img, [pts_sh], False, sh_color, sh_thick, cv2.LINE_AA)
-
-        # Highlight side (offset in direction of light_ang)
-        hl_thick = max(1, int(thick * 0.35))
-        hl_offset = np.array([ldx, ldy]) * rng.uniform(0.5, 1.5)
-        pts_hl = (pts + hl_offset).astype(np.int32)
-        hl_color = np.clip(base_bgr * 1.5 + 40, 0, 255).astype(np.uint8).tolist()
-        cv2.polylines(img, [pts_hl], False, hl_color, hl_thick, cv2.LINE_AA)
-
-        # 4. Specular glint along a portion of the cable
-        if rng.random() < 0.7:
-            glint_len = rng.randint(15, 35)
-            max_start = len(pts) - glint_len - 5
-            if max_start > 5:
-                start_i = rng.randint(5, max_start)
-                pts_glint = pts_hl[start_i : start_i + glint_len]
-                if len(pts_glint) > 1:
-                    glint_thick = max(1, int(thick * 0.15))
-                    glint_color = [240, 240, 240]
-                    cv2.polylines(img, [pts_glint], False, glint_color, glint_thick, cv2.LINE_AA)
-
-
-def round_mask(mask: np.ndarray, rng: random.Random) -> np.ndarray:
-    """Round the sharp rectangle corners and irregularise the occluder outline.
-
-    We first round convex corners using Gaussian blur + threshold,
-    then apply a smooth, low-frequency coordinate displacement (warping)
-    to break up the straight lines and add organic, physical irregularities.
-    """
-    # 1. Rounding corners
-    k = rng.choice((15, 21, 27, 35))
-    m = cv2.GaussianBlur(mask, (k, k), 0)
-    _, m = cv2.threshold(m, 127, 255, cv2.THRESH_BINARY)
-
-    # 2. Add organic border irregularities using low-frequency coordinate displacement
-    h, w = mask.shape[:2]
-    # Downsample grid to ensure low frequency noise
-    nh, nw = max(4, h // 16), max(4, w // 16)
-    dx = np.random.normal(0.0, 1.0, (nh, nw)).astype(np.float32)
-    dy = np.random.normal(0.0, 1.0, (nh, nw)).astype(np.float32)
-    # Smooth the noise by upsampling to full resolution
-    dx = cv2.resize(dx, (w, h), interpolation=cv2.INTER_CUBIC)
-    dy = cv2.resize(dy, (w, h), interpolation=cv2.INTER_CUBIC)
-
-    # Random displacement scale
-    scale = rng.uniform(3.0, 10.0)
-    dx *= scale
-    dy *= scale
-
-    # Map coordinates and warp
-    ys, xs = np.mgrid[0:h, 0:w].astype(np.float32)
-    map_x = xs + dx
-    map_y = ys + dy
-
-    m = cv2.remap(m, map_x, map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-    return m.astype(np.uint8)
-
-
-def shade_occluder_surface(img: np.ndarray, mask: np.ndarray, rng: random.Random) -> None:
-    """Replace the flat-black fill with a shaded dark-grey surface.
-
-    Creates a highly realistic 3D lighting appearance by combining:
-    1. Ambient light (base intensity)
-    2. Directional light (linear gradient with random direction)
-    3. Point light source / spotlight (radial highlight with random center and size)
-    4. Matte plastic/metal surface texture (fine Gaussian noise)
-    """
-    sel = mask > 0
-    if not sel.any():
-        return
-    h, w = mask.shape[:2]
-    ys, xs = np.mgrid[0:h, 0:w].astype(np.float32)
-    sx, sy = np.where(sel)
-
-    # 1. Linear directional light
-    ang = rng.uniform(0.0, 2 * math.pi)
-    grad_lin = math.cos(ang) * xs + math.sin(ang) * ys
-    g_lin = grad_lin[sx, sy]
-    g_lin = (g_lin - g_lin.min()) / (np.ptp(g_lin) + 1e-6)
-
-    # 2. Radial highlight (spotlight/point light)
-    cx_mask, cy_mask = sy.mean(), sx.mean()
-    light_x = cx_mask + rng.uniform(-0.5 * w, 0.5 * w)
-    light_y = cy_mask + rng.uniform(-0.5 * h, 0.5 * h)
-
-    dist_sq = (xs - light_x) ** 2 + (ys - light_y) ** 2
-    # Radius of highlight is related to the scale of the mask/image
-    sigma = rng.uniform(0.3, 0.8) * max(h, w)
-    grad_rad = np.exp(-dist_sq / (2.0 * sigma ** 2))
-    g_rad = grad_rad[sx, sy]
-
-    # Combine components
-    ambient = rng.uniform(25.0, 50.0)
-    linear_amp = rng.uniform(15.0, 45.0)
-    radial_amp = rng.uniform(15.0, 40.0)
-
-    # Noise/texture
-    noise = np.random.normal(0.0, rng.uniform(1.5, 4.0), size=g_lin.shape)
-
-    # Calculate final pixel values
-    vals = ambient + g_lin * linear_amp + g_rad * radial_amp + noise
-    vals = np.clip(vals, 0.0, 160.0).astype(np.uint8)
-
-    # Apply to BGR channels
-    img[sx, sy] = vals[:, None]
-
-
-def add_rim_highlight(img: np.ndarray, mask: np.ndarray, rng: random.Random) -> None:
-    """Soft grey metallic sheen along one edge of the occluder (not white spots)."""
-    # 1. Distance transform to define a band parallel to the edge
-    dist = cv2.distanceTransform(mask, cv2.DIST_L2, 5)
-
-    # Peak distance from edge and width of the band
-    d_peak = rng.uniform(1.0, 4.0)
-    d_width = rng.uniform(2.0, 6.0)
-
-    # Calculate band intensity
-    band = np.exp(-((dist - d_peak) / d_width) ** 2)
-
-    # 2. Gate to restrict to one side
-    ys, xs = np.where(mask > 0)
-    if xs.size == 0:
-        return
-    cx_mask, cy_mask = xs.mean(), ys.mean()
-
-    ang = rng.uniform(0.0, 2 * math.pi)
-    h, w = mask.shape[:2]
-    ys_grid, xs_grid = np.mgrid[0:h, 0:w].astype(np.float32)
-    proj = (xs_grid - cx_mask) * math.cos(ang) + (ys_grid - cy_mask) * math.sin(ang)
-
-    proj_mask = proj[ys, xs]
-    p_min, p_max = proj_mask.min(), proj_mask.max()
-    p_range = p_max - p_min if p_max > p_min else 1.0
-
-    # Soft sigmoid gate selecting one side
-    gate = 1.0 / (1.0 + np.exp(-(proj - (p_min + 0.65 * p_range)) / (0.08 * p_range + 1e-5)))
-
-    # Final highlight mask restricted to the occluder surface
-    highlight = band * gate * (mask > 0)
-    highlight = highlight.astype(np.float32)
-
-    # Soft blend with a metallic grey value
-    val = rng.uniform(110.0, 175.0)
-    a = highlight[..., None]
-    img[:] = np.clip(img.astype(np.float32) * (1.0 - a) + val * a, 0.0, 255.0).astype(np.uint8)
-
-
-def _motion_blur(img: np.ndarray, length: int, angle_deg: float) -> np.ndarray:
-    """Directional (motion) blur with a length-px line kernel at angle_deg."""
-    if length < 3:
-        return img
-    kernel = np.zeros((length, length), dtype=np.float32)
-    kernel[length // 2, :] = 1.0
-    rot = cv2.getRotationMatrix2D((length / 2.0 - 0.5, length / 2.0 - 0.5), angle_deg, 1.0)
-    kernel = cv2.warpAffine(kernel, rot, (length, length))
-    s = kernel.sum()
-    if s > 0:
-        kernel /= s
-    return cv2.filter2D(img, -1, kernel)
-
-
-def soften_occluder(original: np.ndarray, occluded: np.ndarray, mask: np.ndarray,
-                    rng: random.Random, edge_blur: int, motion_blur_max: int
-                    ) -> tuple[np.ndarray, np.ndarray]:
-    """Feather the occluder edge (+ optional motion blur) and alpha-composite.
-
-    Returns (composited_uint8, alpha_float32) where alpha in [0,1] is the soft
-    occluder coverage used to recompute occlusion_ratio.
-    """
-    alpha = mask.astype(np.float32) / 255.0
-    k = edge_blur
-    if k and k % 2 == 0:
-        k += 1
-    if k >= 3:
-        alpha = cv2.GaussianBlur(alpha, (k, k), 0)
-
-    layer = occluded.astype(np.float32)
-    if motion_blur_max >= 3:
-        mlen = rng.randint(0, motion_blur_max)
-        if mlen >= 3:
-            layer = _motion_blur(layer, mlen, rng.uniform(0.0, 180.0))
-            ak = mlen if mlen % 2 == 1 else mlen + 1
-            alpha = cv2.GaussianBlur(alpha, (ak, ak), 0)  # motion softens the edge too
-
-    a = alpha[..., None]
-    out = original.astype(np.float32) * (1.0 - a) + layer * a
-    return np.clip(out, 0.0, 255.0).astype(np.uint8), alpha
-
-
-def ratio_in_marker(alpha: np.ndarray, cx: float, cy: float, radius: float) -> float:
-    """Soft occlusion coverage of the marker disc (matches the circle used by
-    apply_random_occlusion: radius = max(marker_radius, 10))."""
-    circle = np.zeros(alpha.shape, dtype=np.float32)
-    cv2.circle(circle, (int(round(cx)), int(round(cy))), int(round(max(radius, 10.0))), 1.0, -1)
-    denom = float(circle.sum()) + 1e-6
-    return min(float((alpha * circle).sum() / denom), 1.0)
-
-
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--input_dir", type=Path, default=Path("outputs/datasets/6f_labeled_1024x640_roi"))
@@ -441,27 +141,25 @@ def main() -> None:
                     help="Also copy the clean originals (positives + negatives) into the output "
                          "so the dataset is self-contained. Default off (occluded positives only).")
     ap.add_argument("--occ_low_min", type=float, default=0.05)
-    ap.add_argument("--occ_low_max", type=float, default=0.50)
-    ap.add_argument("--occ_hard_min", type=float, default=0.50)
-    ap.add_argument("--occ_hard_max", type=float, default=0.85)
-    ap.add_argument("--occlusion_style", default="aggressive",
-                    choices=["standard", "aggressive", "center_heavy"])
+    ap.add_argument("--occ_low_max", type=float, default=0.45)
+    ap.add_argument("--occ_hard_min", type=float, default=0.45)
+    ap.add_argument("--occ_hard_max", type=float, default=0.65)
+    ap.add_argument("--max_occ_ratio", type=float, default=0.75,
+                    help="Hard cap on measured marker coverage. The marker must keep at least "
+                         "(1 - max_occ_ratio) of its outer disc visible, so the center stays "
+                         "localizable; occluders exceeding this are redrawn (see --occ_max_attempts).")
+    ap.add_argument("--occ_max_attempts", type=int, default=5,
+                    help="Max redraws to satisfy --max_occ_ratio; the least-covering attempt is "
+                         "kept if none qualify.")
+    ap.add_argument("--occlusion_style", default="hardware",
+                    choices=["standard", "aggressive", "center_heavy",
+                             "hardware", "mixed"],
+                    help="Occluder style passed to apply_random_occlusion. 'hardware' paints a "
+                         "realistic FSO-terminal occluder (bracket/barrel/clamp/post + outer-ring "
+                         "blocks) matching the real rig; 'mixed' uses hardware 60%% of the time.")
     ap.add_argument("--occluder_templates", default="auto")
     ap.add_argument("--occ_radius_scale", type=float, default=1.0,
                     help="Multiplier on the (a+b)/4 occluder radius.")
-    ap.add_argument("--realistic", action=argparse.BooleanOptionalAction, default=True,
-                    help="Add real-rig occlusion cues on top of the geometric occluder: "
-                         "curved cables, metallic highlights, soft/motion-blurred edges. "
-                         "Use --no-realistic for the legacy flat-dark-block behaviour.")
-    ap.add_argument("--cable_prob", type=float, default=0.6,
-                    help="Probability of drawing 1-2 curved cables across the marker.")
-    ap.add_argument("--metallic_prob", type=float, default=0.5,
-                    help="Probability of adding bright metallic-glint streaks on the occluder.")
-    ap.add_argument("--edge_blur", type=int, default=7,
-                    help="Gaussian kernel (px) used to feather the occluder edge (0 disables).")
-    ap.add_argument("--motion_blur_max", type=int, default=9,
-                    help="Max directional motion-blur kernel (px); per-variant random in [0,max]. "
-                         "0 disables.")
     ap.add_argument("--skip_out_of_frame", action=argparse.BooleanOptionalAction, default=True,
                     help="Skip occluding markers whose ellipse extends beyond the ROI frame "
                          "(they are already cut off by the boundary). Use --no-skip_out_of_frame "
@@ -540,31 +238,22 @@ def main() -> None:
         for v in range(args.variants_per_positive):
             lo, hi = tiers[v % len(tiers)]
             base = img.copy()
-            occluded, actual_ratio = apply_random_occlusion(
-                base.copy(), (cx, cy), radius,
-                occlusion_range=(lo, hi),
-                occlusion_style=args.occlusion_style,
-                occ_distribution="uniform",
-                occluder_templates=args.occluder_templates,
-            )
-
-            if args.realistic:
-                # Restyle the flat geometric block into a real-rig occluder:
-                # round its edges, shade it as a lit dark-grey part, add an edge
-                # sheen, then cables; finally feather + motion-blur and recompute
-                # the coverage from the resulting soft alpha.
-                mask = occluder_mask_from_diff(base, occluded)
-                if mask.any():
-                    mask = round_mask(mask, random)
-                    shade_occluder_surface(occluded, mask, random)
-                    if random.random() < args.metallic_prob:
-                        add_rim_highlight(occluded, mask, random)
-                if random.random() < args.cable_prob:
-                    draw_cables(occluded, mask, cx, cy, radius, random,
-                                random.randint(1, 2))
-                occluded, alpha = soften_occluder(
-                    base, occluded, mask, random, args.edge_blur, args.motion_blur_max)
-                actual_ratio = ratio_in_marker(alpha, cx, cy, radius)
+            # Redraw until the marker keeps enough visible area to localize the
+            # center; a fully-occluded marker is label noise for the heatmap.
+            best = None  # (ratio, occluded)
+            for _ in range(max(1, args.occ_max_attempts)):
+                occluded, actual_ratio = apply_random_occlusion(
+                    base.copy(), (cx, cy), radius,
+                    occlusion_range=(lo, hi),
+                    occlusion_style=args.occlusion_style,
+                    occ_distribution="uniform",
+                    occluder_templates=args.occluder_templates,
+                )
+                if best is None or actual_ratio < best[0]:
+                    best = (actual_ratio, occluded)
+                if actual_ratio <= args.max_occ_ratio:
+                    break
+            actual_ratio, occluded = best
 
             out_stem = f"{stem}_occ{v}"
             cv2.imwrite(str(img_dir / f"{out_stem}.png"), occluded)
@@ -594,11 +283,8 @@ def main() -> None:
         "occlusion_style": args.occlusion_style,
         "occluder_templates": args.occluder_templates,
         "occ_radius_scale": args.occ_radius_scale,
-        "realistic": bool(args.realistic),
-        "cable_prob": args.cable_prob,
-        "metallic_prob": args.metallic_prob,
-        "edge_blur": args.edge_blur,
-        "motion_blur_max": args.motion_blur_max,
+        "max_occ_ratio": args.max_occ_ratio,
+        "occ_max_attempts": args.occ_max_attempts,
         "skip_out_of_frame": bool(args.skip_out_of_frame),
         "frame_size": [frame_w, frame_h],
         "tiers": {"low": [args.occ_low_min, args.occ_low_max],
