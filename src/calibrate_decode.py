@@ -48,6 +48,7 @@ def main() -> None:
         backbone=cfg["backbone"],
         use_offset_head=cfg.get("use_offset_head", False),
         use_size_head=cfg.get("use_size_head", False),
+        offset_head_hidden=cfg.get("offset_head_hidden", 0),
     )
     ckpt = torch.load(args.run_dir / args.checkpoint, map_location=device, weights_only=False)
     model.load_state_dict(ckpt.get("model_state_dict", ckpt.get("model", ckpt)))

@@ -43,6 +43,8 @@ uv run python src/augment_roi_occlusion.py \
 # Train (DDP, multi-GPU)
 uv run torchrun --nproc_per_node=4 src/train_cctag_heatmap_ddp.py \
   --dataset_dir ./outputs/datasets/mixed --output_dir ./outputs/runs/experiment_ddp
+# Backbones: efficientnet_b0, mobilenet_v3_small, resnet18, resnet18_hires,
+# hrnet_w18.
 
 # Train with Focal Loss (recommended for reducing false positives)
 uv run torchrun --nproc_per_node=4 src/train_cctag_heatmap_ddp.py \

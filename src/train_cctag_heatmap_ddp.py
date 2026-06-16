@@ -193,11 +193,13 @@ def parse_args() -> argparse.Namespace:
             "mobilenet_v3_small",
             "resnet18",
             "resnet18_hires",
+            "hrnet_w18",
         ],
         help="Backbone architecture (default: resnet18). 'resnet18_hires' drops "
         "the stem maxpool (2x finer encoder) and uses a double-conv decoder for "
         "sub-pixel localization; its checkpoints are not interchangeable with "
-        "'resnet18'.",
+        "'resnet18'. 'hrnet_w18' uses timm ImageNet-pretrained HRNetV2 features "
+        "fused at stride 4.",
     )
     parser.add_argument(
         "--align_corners",
@@ -241,6 +243,14 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=1.0,
         help="Weight of the offset L1 loss term. Default: 1.0.",
+    )
+    parser.add_argument(
+        "--offset_head_hidden",
+        type=int,
+        default=0,
+        help="Hidden channels for the offset head. 0 (default) = a single 1x1 conv "
+        "(legacy). >0 inserts a 3x3 conv + ReLU before the 1x1 (e.g. 32/64) for "
+        "higher sub-pixel capacity, directly targeting center-L2.",
     )
     parser.add_argument(
         "--occ_loss_weight",
@@ -339,7 +349,27 @@ def parse_args() -> argparse.Namespace:
         default=6.0,
         help="Max gaussian noise std (0-255 space) when --augment.",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+
+    # HRNet requires input dimensions divisible by 32 (5 × stride-2 stages).
+    # Auto-adjust with a warning so the user doesn't hit a cryptic size-mismatch
+    # RuntimeError inside timm's hrnet.py stage forward.
+    if "hrnet" in args.backbone.lower():
+        def _round_up_32(val: int) -> int:
+            return ((val + 31) // 32) * 32
+
+        w_ok = _round_up_32(args.input_width)
+        h_ok = _round_up_32(args.input_height)
+        if args.input_width != w_ok or args.input_height != h_ok:
+            print(
+                f"[HRNet] input dimensions must be multiples of 32 "
+                f"(got {args.input_width}x{args.input_height}). "
+                f"Auto-adjusting to {w_ok}x{h_ok}."
+            )
+            args.input_width = w_ok
+            args.input_height = h_ok
+
+    return args
 
 
 def ensure_torchvision() -> tuple[Any, Any]:
@@ -373,6 +403,17 @@ def ensure_resnet18() -> tuple[Any, Any]:
             "Install it with: pip install torchvision"
         ) from exc
     return resnet18, ResNet18_Weights
+
+
+def ensure_timm() -> Any:
+    try:
+        import timm
+    except ImportError as exc:
+        raise SystemExit(
+            "timm is required for HRNet backbones.\n"
+            "Install it with: uv sync (timm is now a dependency) or pip install timm"
+        ) from exc
+    return timm
 
 
 def set_seed(seed: int) -> None:
@@ -803,6 +844,26 @@ class CombinedHeatmapLoss(nn.Module):
         return total
 
 
+def make_offset_head(in_ch: int, hidden: int = 0) -> nn.Module:
+    """Sub-pixel offset (dx, dy) regression head.
+
+    hidden <= 0 -> a single 1x1 conv (legacy). Keeps state_dict keys
+                   ``offset_head.weight`` / ``offset_head.bias`` so checkpoints
+                   trained before this option still load unchanged.
+    hidden  > 0 -> 3x3(in_ch->hidden) + ReLU + 1x1(hidden->2). A higher-capacity
+                   head: the only mechanism that recovers sub-stride precision, so
+                   widening it directly targets center-L2 without touching the
+                   backbone (keys become ``offset_head.0.*`` / ``offset_head.2.*``).
+    """
+    if hidden <= 0:
+        return nn.Conv2d(in_ch, 2, kernel_size=1)
+    return nn.Sequential(
+        nn.Conv2d(in_ch, hidden, kernel_size=3, padding=1),
+        nn.ReLU(inplace=True),
+        nn.Conv2d(hidden, 2, kernel_size=1),
+    )
+
+
 class CCTagNet(nn.Module):
     """EfficientNet-B0 encoder with U-Net style skip connections.
 
@@ -822,6 +883,7 @@ class CCTagNet(nn.Module):
         heatmap_size: tuple[int, int],
         use_offset_head: bool = False,
         use_size_head: bool = False,
+        offset_head_hidden: int = 0,
     ) -> None:
         super().__init__()
         efficientnet_b0, EfficientNet_B0_Weights = ensure_torchvision()
@@ -843,7 +905,7 @@ class CCTagNet(nn.Module):
 
         self.head = nn.Sequential(nn.Conv2d(32, 1, kernel_size=1), nn.Sigmoid())
         if use_offset_head:
-            self.offset_head = nn.Conv2d(32, 2, kernel_size=1)
+            self.offset_head = make_offset_head(32, offset_head_hidden)
         if use_size_head:
             self.size_head = nn.Conv2d(32, 2, kernel_size=1)
 
@@ -932,6 +994,7 @@ class CCTagNetMobileV3(nn.Module):
         heatmap_size: tuple[int, int],
         use_offset_head: bool = False,
         use_size_head: bool = False,
+        offset_head_hidden: int = 0,
     ) -> None:
         super().__init__()
         mobilenet_v3_small, MobileNet_V3_Small_Weights = ensure_mobilenet_v3_small()
@@ -947,7 +1010,7 @@ class CCTagNetMobileV3(nn.Module):
         self.dec4 = self._dec_block(32 + 16, 16)
         self.head = nn.Sequential(nn.Conv2d(16, 1, kernel_size=1), nn.Sigmoid())
         if use_offset_head:
-            self.offset_head = nn.Conv2d(16, 2, kernel_size=1)
+            self.offset_head = make_offset_head(16, offset_head_hidden)
         if use_size_head:
             self.size_head = nn.Conv2d(16, 2, kernel_size=1)
 
@@ -1030,6 +1093,7 @@ class CCTagNetResNet18(nn.Module):
         heatmap_size: tuple[int, int],
         use_offset_head: bool = False,
         use_size_head: bool = False,
+        offset_head_hidden: int = 0,
     ) -> None:
         super().__init__()
         resnet18, ResNet18_Weights = ensure_resnet18()
@@ -1054,7 +1118,7 @@ class CCTagNetResNet18(nn.Module):
         self.dec4 = self._dec_block(64 + 64, 32)
         self.head = nn.Sequential(nn.Conv2d(32, 1, kernel_size=1), nn.Sigmoid())
         if use_offset_head:
-            self.offset_head = nn.Conv2d(32, 2, kernel_size=1)
+            self.offset_head = make_offset_head(32, offset_head_hidden)
         if use_size_head:
             self.size_head = nn.Conv2d(32, 2, kernel_size=1)
 
@@ -1150,6 +1214,7 @@ class CCTagNetResNet18HiRes(nn.Module):
         heatmap_size: tuple[int, int],
         use_offset_head: bool = False,
         use_size_head: bool = False,
+        offset_head_hidden: int = 0,
     ) -> None:
         super().__init__()
         resnet18, ResNet18_Weights = ensure_resnet18()
@@ -1173,7 +1238,7 @@ class CCTagNetResNet18HiRes(nn.Module):
         self.dec3 = self._dec_block(128 + 64, 64)
         self.head = nn.Sequential(nn.Conv2d(64, 1, kernel_size=1), nn.Sigmoid())
         if use_offset_head:
-            self.offset_head = nn.Conv2d(64, 2, kernel_size=1)
+            self.offset_head = make_offset_head(64, offset_head_hidden)
         if use_size_head:
             self.size_head = nn.Conv2d(64, 2, kernel_size=1)
 
@@ -1219,6 +1284,96 @@ class CCTagNetResNet18HiRes(nn.Module):
         x = self.dec2(self._up_cat(x, s128_s4))
         x = self.dec3(self._up_cat(x, s64_s2))
         feat = x
+        heatmap = nn.functional.interpolate(
+            self.head(feat),
+            size=(self.heatmap_height, self.heatmap_width),
+            mode="bilinear",
+            align_corners=DECODE_ALIGN_CORNERS,
+        )
+        offset = None
+        if self.use_offset_head:
+            offset = nn.functional.interpolate(
+                self.offset_head(feat),
+                size=(self.heatmap_height, self.heatmap_width),
+                mode="bilinear",
+                align_corners=DECODE_ALIGN_CORNERS,
+            )
+        size = None
+        if self.use_size_head:
+            size = nn.functional.interpolate(
+                self.size_head(feat),
+                size=(self.heatmap_height, self.heatmap_width),
+                mode="bilinear",
+                align_corners=DECODE_ALIGN_CORNERS,
+            )
+        if self.use_offset_head or self.use_size_head:
+            return heatmap, offset, size
+        return heatmap
+
+
+class CCTagNetHRNet(nn.Module):
+    """HRNet backbone with a stride-4 HRNetV2 fusion head for heatmap regression.
+
+    Uses timm's features_only API to get HRNet's multi-resolution branch outputs,
+    upsamples them all to the finest branch, concatenates them, and applies a
+    compact convolutional fusion head. Channel dims come from feature_info so
+    the class is not tied to one hardcoded HRNet channel layout.
+    """
+
+    def __init__(
+        self,
+        heatmap_size: tuple[int, int],
+        variant: str = "hrnet_w18",
+        use_offset_head: bool = False,
+        use_size_head: bool = False,
+        pretrained: bool = True,
+        offset_head_hidden: int = 0,
+    ) -> None:
+        super().__init__()
+        timm = ensure_timm()
+        # out_indices=(1,2,3,4) drops timm's stride-2 stem feature; we fuse the
+        # four HRNet branches at stride 4 (the documented HRNetV2 head). Keeping
+        # the stem would fuse 1984 ch at half-res (320x512), ~4x the activation
+        # memory and a different resolution than the heatmap target.
+        self.encoder = timm.create_model(
+            variant, pretrained=pretrained, features_only=True,
+            out_indices=(1, 2, 3, 4),
+        )
+        sum_ch = sum(self.encoder.feature_info.channels())
+        fuse_ch = 128
+        self.fuse = nn.Sequential(
+            nn.Conv2d(sum_ch, fuse_ch, kernel_size=1),
+            nn.BatchNorm2d(fuse_ch),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(fuse_ch, fuse_ch, kernel_size=3, padding=1),
+            nn.BatchNorm2d(fuse_ch),
+            nn.ReLU(inplace=True),
+        )
+        self.head = nn.Sequential(nn.Conv2d(fuse_ch, 1, kernel_size=1), nn.Sigmoid())
+        self.heatmap_height, self.heatmap_width = heatmap_size
+        self.use_offset_head = use_offset_head
+        self.use_size_head = use_size_head
+        if use_offset_head:
+            self.offset_head = make_offset_head(fuse_ch, offset_head_hidden)
+        if use_size_head:
+            self.size_head = nn.Conv2d(fuse_ch, 2, kernel_size=1)
+
+    def forward(
+        self, x: torch.Tensor
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+        feats = self.encoder(x)
+        target = feats[0].shape[2:]
+        ups = [feats[0]]
+        ups.extend(
+            nn.functional.interpolate(
+                feat,
+                size=target,
+                mode="bilinear",
+                align_corners=DECODE_ALIGN_CORNERS,
+            )
+            for feat in feats[1:]
+        )
+        feat = self.fuse(torch.cat(ups, dim=1))
         heatmap = nn.functional.interpolate(
             self.head(feat),
             size=(self.heatmap_height, self.heatmap_width),
@@ -1830,6 +1985,7 @@ def write_run_config(
         "world_size": world_size,
         "use_offset_head": bool(getattr(args, "offset_head", False)),
         "offset_weight": float(getattr(args, "offset_weight", 1.0)),
+        "offset_head_hidden": int(getattr(args, "offset_head_hidden", 0)),
         "use_size_head": bool(getattr(args, "size_head", False)),
         "size_weight": float(getattr(args, "size_weight", 1.0)),
         "use_focal": bool(getattr(args, "focal_loss", False)),
@@ -1946,12 +2102,17 @@ def build_model(
     backbone: str = "efficientnet_b0",
     use_offset_head: bool = False,
     use_size_head: bool = False,
+    offset_head_hidden: int = 0,
     channels_last: bool = False,
 ) -> nn.Module:
     # Rank 0 loads pretrained weights first so other ranks can reuse the local cache.
     if world_size > 1 and rank != 0:
         dist.barrier()
-    head_kwargs = {"use_offset_head": use_offset_head, "use_size_head": use_size_head}
+    head_kwargs = {
+        "use_offset_head": use_offset_head,
+        "use_size_head": use_size_head,
+        "offset_head_hidden": offset_head_hidden,
+    }
     if backbone == "mobilenet_v3_small":
         model = CCTagNetMobileV3(heatmap_size=heatmap_size, **head_kwargs).to(device)
     elif backbone == "resnet18":
@@ -1960,6 +2121,10 @@ def build_model(
         model = CCTagNetResNet18HiRes(heatmap_size=heatmap_size, **head_kwargs).to(
             device
         )
+    elif backbone == "hrnet_w18":
+        model = CCTagNetHRNet(
+            heatmap_size=heatmap_size, variant=backbone, **head_kwargs
+        ).to(device)
     else:
         model = CCTagNet(heatmap_size=heatmap_size, **head_kwargs).to(device)
     if channels_last:
@@ -2020,6 +2185,7 @@ def main() -> None:
         backbone=args.backbone,
         use_offset_head=args.offset_head,
         use_size_head=args.size_head,
+        offset_head_hidden=args.offset_head_hidden,
         channels_last=args.channels_last,
     )
     if args.resume_from is not None:
