@@ -10,12 +10,15 @@ Synthetic CCTag (fiducial marker) dataset generation and heatmap regression trai
 
 - **Python**: 3.12.11 (strict pin via `.python-version`)
 - **Dependency manager**: uv + pyproject.toml
-- **PyTorch**: 2.11.0 with CUDA 12.6 or CPU variants (mutually exclusive extras)
+- **PyTorch**: 2.11.0+cu126 (Linux GPU-only). torch is a hard base dependency
+  pinned to the official cu126 index, NOT an optional extra. This is deliberate:
+  when torch lived only under an extra, a bare `uv run/sync` (no `--extra`)
+  resolved the transitive torch (via timm) from pypi.org's generic build, which
+  pulled `nvidia-*-cu13` wheels and broke cuDNN (CUDNN_STATUS_NOT_INITIALIZED).
 
 ```bash
-uv sync --extra cu126       # GPU
-uv sync --extra cpu         # CPU-only
-# or: bash scripts/bootstrap_env.sh
+uv sync                     # installs torch 2.11.0+cu126 (no --extra needed)
+uv sync --extra cu126       # equivalent; `cu126` is kept as a no-op alias
 ```
 
 ## Common Commands

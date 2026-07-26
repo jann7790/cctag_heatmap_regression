@@ -95,6 +95,25 @@ def validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> 
             "Use --marker_max with a value >= --marker_min, "
             "for example --marker_min 200 --marker_max 400."
         )
+    if args.actual_diameter_min is not None and args.actual_diameter_min <= 0.0:
+        parser.error("--actual_diameter_min must be > 0 when set.")
+    if args.actual_diameter_max is not None and args.actual_diameter_max <= 0.0:
+        parser.error("--actual_diameter_max must be > 0 when set.")
+    if (
+        args.actual_diameter_min is not None
+        and args.actual_diameter_max is not None
+        and args.actual_diameter_min > args.actual_diameter_max
+    ):
+        parser.error("--actual_diameter_min cannot exceed --actual_diameter_max.")
+    if args.actual_diameter_max_attempts <= 0:
+        parser.error("--actual_diameter_max_attempts must be positive.")
+    if not 0.0 <= args.visible_marker_ratio_min <= 1.0:
+        parser.error("--visible_marker_ratio_min must be between 0.0 and 1.0.")
+    if args.visible_marker_ratio_max is not None:
+        if not 0.0 <= args.visible_marker_ratio_max <= 1.0:
+            parser.error("--visible_marker_ratio_max must be between 0.0 and 1.0.")
+        if args.visible_marker_ratio_min > args.visible_marker_ratio_max:
+            parser.error("--visible_marker_ratio_min cannot exceed --visible_marker_ratio_max.")
     if args.occ_min > args.occ_max:
         parser.error(
             f"--occ_min ({args.occ_min}) cannot be larger than --occ_max ({args.occ_max})."
@@ -767,6 +786,31 @@ def apply_random_occlusion(
         rx1, ry1, rx2, ry2 = clamp_rect(fx1, fy1, fx2, fy2)
         cv2.rectangle(mask, (rx1, ry1), (rx2, ry2), 255, -1)
 
+    if occlusion_style == "inner_ring_center":
+        # `r` is the radius of the innermost CCTag ring for cctag_source.
+        # Constrain the blocker to its central 78%, preserving a continuous
+        # outer ring arc while heavily obscuring the inner white region.
+        inner_mask = np.zeros((h, w), dtype=np.uint8)
+        cv2.circle(inner_mask, (int(round(cx)), int(round(cy))),
+                   max(1, int(round(0.78 * r))), 255, -1, cv2.LINE_AA)
+        shape_mask = np.zeros((h, w), dtype=np.uint8)
+        axes = (
+            max(2, int(round(random.uniform(0.48, 0.75) * r))),
+            max(2, int(round(random.uniform(0.48, 0.75) * r))),
+        )
+        offset = 0.12 * r
+        center_pt = (
+            int(round(cx + random.uniform(-offset, offset))),
+            int(round(cy + random.uniform(-offset, offset))),
+        )
+        cv2.ellipse(shape_mask, center_pt, axes, random.uniform(0, 180),
+                    0, 360, 255, -1, cv2.LINE_AA)
+        shape_mask = cv2.bitwise_and(shape_mask, inner_mask)
+        apply_mask(shape_mask)
+        marker_pixels = max(int(np.count_nonzero(marker_mask)), 1)
+        occluded_marker_pixels = int(np.count_nonzero((marker_mask > 0) & (occlusion_mask > 0)))
+        return img, min(occluded_marker_pixels / marker_pixels, 1.0)
+
     def template_single(mask: np.ndarray, ratio_scale: float) -> None:
         # One big rectangle covering the marker. Random aspect.
         aspect_pick = random.random()
@@ -1024,6 +1068,8 @@ def apply_random_occlusion(
                     patch[:, s:s + stripe_w] = 255
                 if random.random() < 0.5:
                     patch = patch.T[:patch_side, :patch_side]
+                if img.ndim == 3:
+                    patch = np.repeat(patch[:, :, None], img.shape[2], axis=2)
                 img[py:py + patch_side, px:px + patch_side] = patch
                 occlusion_mask[py:py + patch_side, px:px + patch_side] = 255
 
@@ -1042,11 +1088,17 @@ def apply_random_occlusion(
                     ])
                 pts = np.array(pts, dtype=np.int32)
                 color = random.randint(0, 255)
-                cv2.fillPoly(img, [pts], color)
+                fill = (color, color, color) if img.ndim == 3 else color
+                cv2.fillPoly(img, [pts], fill)
                 cv2.fillPoly(occlusion_mask, [pts], 255)
 
             else:
-                noise = np.random.randint(0, 256, (patch_side, patch_side), dtype=np.uint8)
+                noise_shape = (
+                    (patch_side, patch_side, img.shape[2])
+                    if img.ndim == 3
+                    else (patch_side, patch_side)
+                )
+                noise = np.random.randint(0, 256, noise_shape, dtype=np.uint8)
                 if random.random() < 0.5:
                     noise = cv2.GaussianBlur(noise, (7, 7), 3)
                 img[py:py + patch_side, px:px + patch_side] = noise
@@ -1549,6 +1601,16 @@ def sample_marker_center(
                 return sampled
         return sample_fully_inside()
 
+    if placement_mode == "bottom_corner":
+        # Keep the true center just outside both axes.  A circle whose center is
+        # at a tile corner exposes one quarter; moving it 0-5% of its radius out
+        # along each axis gives the 20-25% corner-proxy regime.
+        offset_x = random.uniform(0.001, 0.05) * marker_radius
+        offset_y = random.uniform(0.001, 0.05) * marker_radius
+        if random.choice((True, False)):
+            return -offset_x, render_h + offset_y
+        return render_w + offset_x, render_h + offset_y
+
     if partial_out_prob <= 0.0 or random.random() >= partial_out_prob:
         return sample_fully_inside()
 
@@ -1846,6 +1908,7 @@ def generate_single_sample(
     empty_negative_prob: float = 0.0,
     force_empty_negative: bool = False,
     force_boundary_target: bool = False,
+    force_bottom_corner_target: bool = False,
     force_normal_positive: bool = False,
     degradation_preset: str = "standard",
     soft_focus_strength: float = 0.0,
@@ -1864,6 +1927,11 @@ def generate_single_sample(
     vignette_strength_range: tuple[float, float] = (0.4, 0.9),
     occ_distribution: str = "uniform",
     occluder_templates: str = "auto",
+    actual_diameter_range: tuple[float | None, float | None] = (None, None),
+    actual_diameter_max_attempts: int = 100,
+    visible_marker_ratio_range: tuple[float, float | None] = (0.0, None),
+    required_target_clamped: int | None = None,
+    required_bottom_corner_target: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, dict]:
     """
     Generate one training sample: image + heatmap + metadata.
@@ -1898,19 +1966,36 @@ def generate_single_sample(
             vignette_strength_range=vignette_strength_range,
         )
 
-    desired_target_clamped = None
+    desired_target_clamped = required_target_clamped
     effective_partial_out_prob = partial_out_prob
     placement_mode = "auto"
     if force_boundary_target:
         desired_target_clamped = 1
         effective_partial_out_prob = 1.0
         placement_mode = "boundary"
+    elif force_bottom_corner_target:
+        desired_target_clamped = 1
+        effective_partial_out_prob = 1.0
+        placement_mode = "bottom_corner"
     elif force_normal_positive:
         desired_target_clamped = 0
         effective_partial_out_prob = 0.0
         placement_mode = "inside"
 
-    max_attempts = 16 if desired_target_clamped == 1 else 1
+    actual_min, actual_max = actual_diameter_range
+    visible_min, visible_max = visible_marker_ratio_range
+    constrain_actual_diameter = actual_min is not None or actual_max is not None
+    constrain_acceptance = (
+        constrain_actual_diameter
+        or visible_min > 0.0
+        or visible_max is not None
+        or required_target_clamped is not None
+    )
+    max_attempts = (
+        actual_diameter_max_attempts
+        if constrain_acceptance
+        else (16 if desired_target_clamped == 1 else 1)
+    )
     last_sample = None
     for _ in range(max_attempts):
         last_sample = generate_marker_sample(
@@ -1945,9 +2030,37 @@ def generate_single_sample(
             occluder_templates=occluder_templates,
         )
         _, _, meta = last_sample
-        if desired_target_clamped is None or meta["target_clamped"] == desired_target_clamped:
+        target_matches = (
+            desired_target_clamped is None
+            or meta["target_clamped"] == desired_target_clamped
+        )
+        actual_diameter = 2.0 * max(meta["ellipse_a"], meta["ellipse_b"])
+        diameter_matches = (
+            (actual_min is None or actual_diameter >= actual_min)
+            and (actual_max is None or actual_diameter <= actual_max)
+        )
+        visibility = float(meta.get("visible_marker_ratio", 1.0))
+        visibility_matches = visibility >= visible_min and (
+            visible_max is None or visibility <= visible_max
+        )
+        bottom_corner_matches = not required_bottom_corner_target or (
+            meta["target_clamped"] == 1
+            and meta["y"] == float(output_size[1] - 1)
+            and meta["x"] in (0.0, float(output_size[0] - 1))
+        )
+        if target_matches and diameter_matches and visibility_matches and bottom_corner_matches:
             return last_sample
 
+    if constrain_acceptance:
+        assert last_sample is not None
+        last_meta = last_sample[2]
+        last_diameter = 2.0 * max(last_meta["ellipse_a"], last_meta["ellipse_b"])
+        raise RuntimeError(
+            "Could not generate a positive matching final acceptance rules after "
+            f"{max_attempts} attempts (diameter={last_diameter:.2f}px, "
+            f"visibility={last_meta.get('visible_marker_ratio', 1.0):.3f}, "
+            f"target_clamped={last_meta.get('target_clamped', 0)})."
+        )
     return last_sample
 
 
@@ -2027,6 +2140,11 @@ def generate_dataset(args):
         "marker_id": args.marker_id,
         "num_rings": args.num_rings,
         "marker_diameter_range": [args.marker_min, args.marker_max],
+        "actual_diameter_range": [args.actual_diameter_min, args.actual_diameter_max],
+        "actual_diameter_max_attempts": args.actual_diameter_max_attempts,
+        "visible_marker_ratio_range": [args.visible_marker_ratio_min, args.visible_marker_ratio_max],
+        "required_target_clamped": args.required_target_clamped,
+        "force_bottom_corner_target": args.force_bottom_corner_target,
         "occlusion_range": [args.occ_min, args.occ_max],
         "occlusion_style": args.occlusion_style,
         "partial_out_prob": args.partial_out_prob,
@@ -2110,6 +2228,7 @@ def generate_dataset(args):
             empty_negative_prob=0.0 if forced_sample_modes is not None else args.empty_negative_prob,
             force_empty_negative=(sample_mode == "empty_negative"),
             force_boundary_target=(sample_mode == "boundary_target"),
+            force_bottom_corner_target=args.force_bottom_corner_target,
             force_normal_positive=(sample_mode == "normal_positive"),
             degradation_preset=args.degradation_preset,
             soft_focus_strength=args.soft_focus_strength,
@@ -2128,6 +2247,17 @@ def generate_dataset(args):
             vignette_strength_range=(args.vignette_strength_min, args.vignette_strength_max),
             occ_distribution=args.occ_distribution,
             occluder_templates=args.occluder_templates,
+            actual_diameter_range=(
+                args.actual_diameter_min,
+                args.actual_diameter_max,
+            ),
+            actual_diameter_max_attempts=args.actual_diameter_max_attempts,
+            visible_marker_ratio_range=(
+                args.visible_marker_ratio_min,
+                args.visible_marker_ratio_max,
+            ),
+            required_target_clamped=args.required_target_clamped,
+            required_bottom_corner_target=args.force_bottom_corner_target,
         )
 
         fname = f"{i:06d}"
@@ -2230,12 +2360,26 @@ def main():
                         help="Min marker diameter in px (simulates far distance)")
     parser.add_argument("--marker_max", type=int, default=80,
                         help="Max marker diameter in px (simulates close distance)")
+    parser.add_argument("--actual_diameter_min", type=float, default=None,
+                        help="Reject transformed positives whose final 2*max(ellipse_a, ellipse_b) is below this value.")
+    parser.add_argument("--actual_diameter_max", type=float, default=None,
+                        help="Reject transformed positives whose final 2*max(ellipse_a, ellipse_b) is above this value.")
+    parser.add_argument("--actual_diameter_max_attempts", type=int, default=100,
+                        help="Maximum generation attempts per constrained positive (default: 100).")
+    parser.add_argument("--visible_marker_ratio_min", type=float, default=0.0,
+                        help="Reject positives below this final visible-marker fraction.")
+    parser.add_argument("--visible_marker_ratio_max", type=float, default=None,
+                        help="Reject positives above this final visible-marker fraction when set.")
+    parser.add_argument("--required_target_clamped", type=int, choices=[0, 1], default=None,
+                        help="Require final positive labels to have this target_clamped state.")
+    parser.add_argument("--force_bottom_corner_target", action="store_true",
+                        help="Generate positives whose true center is outside a lower tile corner.")
     parser.add_argument("--occ_min", type=float, default=0.0,
                         help="Min occlusion ratio (default: 0.0)")
     parser.add_argument("--occ_max", type=float, default=0.6,
                         help="Max occlusion ratio (default: 0.6)")
     parser.add_argument("--occlusion_style", type=str, default="standard",
-                        choices=["standard", "aggressive", "center_heavy",
+                        choices=["standard", "aggressive", "center_heavy", "inner_ring_center",
                                  "hardware", "mixed"],
                         help="Occlusion pattern style. 'aggressive'/'center_heavy' create thick "
                              "center-crossing blockers; 'hardware' paints a realistic FSO-terminal "

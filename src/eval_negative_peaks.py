@@ -85,6 +85,7 @@ def main() -> None:
         use_offset_head=cfg.get("use_offset_head", False),
         use_size_head=cfg.get("use_size_head", False),
         offset_head_hidden=cfg.get("offset_head_hidden", 0),
+        decoder_blocks=cfg.get("decoder_blocks", 1),
     )
     ckpt = torch.load(
         args.run_dir / args.checkpoint, map_location=device, weights_only=False

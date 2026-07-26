@@ -1,0 +1,29 @@
+{
+  "params": {
+    "R_LO": 92.0,
+    "BUFFER_K": 3,
+    "DEV_VAL_FRAC": 0.1,
+    "SEED": 42
+  },
+  "real_source_frames": {
+    "holdout_frames": 142,
+    "train_frames": 855,
+    "buffer_frames_dropped": 76
+  },
+  "crop_counts": {
+    "train_total": 21781,
+    "synthetic_dev_val": 1350,
+    "real_holdout": 2020,
+    "real_buffer_dropped": 916
+  },
+  "real_holdout_radius_px": {
+    "n_positives": 2020,
+    "min": 58.85857009887695,
+    "max": 91.99536514282227
+  },
+  "real_train_radius_px": {
+    "n_positives": 5938,
+    "min": 92.00012969970703,
+    "max": 1032.0719604492188
+  }
+}

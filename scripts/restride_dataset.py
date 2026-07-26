@@ -17,6 +17,7 @@ Usage:
 
 import argparse
 import csv
+import json
 import shutil
 from functools import lru_cache
 from pathlib import Path
@@ -52,7 +53,16 @@ def link_or_copy(src: Path, dst: Path) -> None:
         shutil.copy2(src, dst)
 
 
-def restride(src: Path, output: Path, stride: int, sigma: float) -> None:
+def restride(
+    src: Path,
+    output: Path,
+    stride: int,
+    sigma: float,
+    sigma_mode: str = "fixed",
+    sigma_k: float = 0.15,
+    sigma_min: float = 1.0,
+    sigma_max: float = 3.0,
+) -> None:
     images_dir = src / "images"
     labels_csv = src / "labels.csv"
     if not images_dir.is_dir():
@@ -96,17 +106,53 @@ def restride(src: Path, output: Path, stride: int, sigma: float) -> None:
             heatmap = np.zeros((hm_h, hm_w), dtype=np.float32)
             n_neg += 1
         else:
-            heatmap = gaussian_heatmap((hm_h, hm_w), (cx / stride, cy / stride), sigma)
+            if sigma_mode == "adaptive":
+                ea_str = row.get("ellipse_a", "")
+                ea = float(ea_str) if ea_str and float(ea_str) > 0 else -1.0
+                if ea > 0:
+                    sigma_cell = max(sigma_min, min(sigma_k * ea / stride, sigma_max))
+                else:
+                    sigma_cell = sigma  # fallback to fixed
+            else:
+                sigma_cell = sigma
+            heatmap = gaussian_heatmap((hm_h, hm_w), (cx / stride, cy / stride), sigma_cell)
             n_pos += 1
         np.savez_compressed(
             heatmaps_out / f"{filename}.npz", heatmap=heatmap.astype(np.float16)
         )
 
+    sigma_desc = (
+        f"sigma_mode=adaptive, sigma_k={sigma_k}, "
+        f"sigma_min={sigma_min}, sigma_max={sigma_max}"
+        if sigma_mode == "adaptive"
+        else f"sigma={sigma}"
+    )
     print(
         f"{src.name}: wrote {n_pos + n_neg} heatmaps "
-        f"({hm_h}x{hm_w}, stride={stride}, sigma={sigma}) "
+        f"({hm_h}x{hm_w}, stride={stride}, {sigma_desc}) "
         f"positives={n_pos} negatives={n_neg} -> {output}"
     )
+
+    # Write a restride-specific config.json (overwrites the one symlinked from
+    # the source so we record the actual sigma parameters used).
+    restride_config = {
+        "source_dir": str(src.resolve()),
+        "stride": stride,
+        "sigma_mode": sigma_mode,
+        "sigma": sigma,
+        "sigma_k": sigma_k if sigma_mode == "adaptive" else None,
+        "sigma_min": sigma_min if sigma_mode == "adaptive" else None,
+        "sigma_max": sigma_max if sigma_mode == "adaptive" else None,
+        "heatmap_width": hm_w,
+        "heatmap_height": hm_h,
+        "n_positives": n_pos,
+        "n_negatives": n_neg,
+    }
+    config_out = output / "config.json"
+    # Remove symlink if link_or_copy created one
+    if config_out.is_symlink():
+        config_out.unlink()
+    config_out.write_text(json.dumps(restride_config, indent=2), encoding="utf-8")
 
 
 def main() -> None:
@@ -115,8 +161,28 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--stride", type=int, default=2)
     parser.add_argument("--sigma", type=float, default=3.0)
+    parser.add_argument(
+        "--sigma_mode",
+        choices=["fixed", "adaptive"],
+        default="fixed",
+        help="'fixed' (default) uses --sigma for all markers. "
+        "'adaptive' computes sigma_cells = clip(sigma_k * ellipse_a / stride, sigma_min, sigma_max) "
+        "per marker from labels.csv.",
+    )
+    parser.add_argument("--sigma_k", type=float, default=0.15,
+                        help="Scaling factor for adaptive sigma. Default: 0.15.")
+    parser.add_argument("--sigma_min", type=float, default=1.0,
+                        help="Minimum sigma in adaptive mode (heatmap cells). Default: 1.0.")
+    parser.add_argument("--sigma_max", type=float, default=3.0,
+                        help="Maximum sigma in adaptive mode (heatmap cells). Default: 3.0.")
     args = parser.parse_args()
-    restride(args.src, args.output, args.stride, args.sigma)
+    restride(
+        args.src, args.output, args.stride, args.sigma,
+        sigma_mode=args.sigma_mode,
+        sigma_k=args.sigma_k,
+        sigma_min=args.sigma_min,
+        sigma_max=args.sigma_max,
+    )
 
 
 if __name__ == "__main__":

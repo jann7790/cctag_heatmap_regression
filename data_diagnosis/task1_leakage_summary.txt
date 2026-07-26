@@ -1,0 +1,16 @@
+# Task 1 — existing random-split leakage (fable_occ_1024_offset config)
+
+Total merged samples: 26067
+Per-source counts: {'mixed': 13500, 'roi': 6155, 'roi_occ': 3484, 'real_world_merged': 2547, 'hardneg1': 335, 'hardneg2': 37, 'hardneg3': 9}
+train_ratio=0.9 seed=42  ->  train=23460 val=2607
+Unique real source frames on timeline: 1073
+Real-frame crops landing in val: 996
+
+Nearest-train-neighbour frame-index distance for real val crops:
+  <=  0 frames :   996 / 996  (100.0%)
+  <=  1 frames :   996 / 996  (100.0%)
+  <=  2 frames :   996 / 996  (100.0%)
+  <=  5 frames :   996 / 996  (100.0%)
+  <= 10 frames :   996 / 996  (100.0%)
+
+Same source frame already in train (distance 0): 996 (100.0%)  <- near-duplicate crops of the SAME frame.

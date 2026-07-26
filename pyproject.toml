@@ -7,30 +7,27 @@ name = "cctag-heatmap-regression"
 version = "0.1.0"
 description = "Synthetic CCTag dataset generation, training, and inference workspace."
 readme = "README.md"
-# Loosened from ==3.12.11 so this can be a uv workspace member of `fso`
-# (requires-python ==3.10.*). The intersection inside that workspace is 3.10.*;
-# standalone it still resolves on newer 3.x. No 3.11/3.12-only syntax is used.
 requires-python = ">=3.10"
 dependencies = [
-    # Kept within fso's `>=2.0,<2.4` window so the shared workspace lockfile
-    # resolves (was pinned ==2.4.3, which fso excludes).
     "numpy>=2.0,<2.4",
     "opencv-python==4.13.0.92",
     "timm>=1.0.0",
-]
-
-[project.optional-dependencies]
-cpu = [
+    # torch is a hard cu126 dependency (this is a Linux GPU-only repo). It is NOT
+    # an optional extra: when torch lives only under extras, a bare `uv run/sync`
+    # (no --extra) resolves the transitive torch (pulled by timm) from pypi.org's
+    # generic 2.11.0 build, which depends on nvidia-*-cu13 wheels and clobbers the
+    # cu126 cuDNN libs -> CUDNN_STATUS_NOT_INITIALIZED. Pinning it here removes the
+    # no-extra resolution path entirely, so cu13 can never enter the lock or venv.
     "torch==2.11.0",
     "torchvision==0.26.0",
 ]
-cu126 = [
-    "torch==2.11.0+cu126",
-    "torchvision==0.26.0+cu126",
-]
-# Detection (acquisition) stage: YOLO-nano via ultralytics. Isolated extra so it
-# coexists with either the cpu or cu126 torch extra. Install alongside one of them:
-#   uv sync --extra cu126 --extra detect
+
+[project.optional-dependencies]
+# Backward-compat no-op alias: torch is now a base dependency, so `--extra cu126`
+# is redundant, but it is kept (empty) so existing `uv run/sync --extra cu126`
+# invocations in scripts and docs keep working.
+cu126 = []
+# Detection (acquisition) stage: YOLO-nano via ultralytics. Kept isolated.
 detect = [
     "ultralytics>=8.3.0",
 ]
@@ -40,16 +37,12 @@ dev = []
 
 [tool.uv]
 package = false
-conflicts = [
-    [
-        { extra = "cpu" },
-        { extra = "cu126" },
-    ],
+# torch==2.11.0+cu126 only has Linux wheels; restrict resolution to Linux so the
+# lock does not try (and fail) to find macOS/Windows cu126 wheels.
+environments = [
+    "sys_platform == 'linux'",
 ]
 
-# Index/source config mirrors fso's so the two pyprojects agree inside one
-# workspace (same index names must point at the same URLs). Standalone, this
-# repo resolves through the same mirrors.
 [[tool.uv.index]]
 name = "tsinghua"
 url = "https://pypi.tuna.tsinghua.edu.cn/simple"
@@ -59,22 +52,13 @@ default = true
 name = "pypi"
 url = "https://pypi.org/simple"
 
-[[tool.uv.index]]
-name = "pytorch-cpu"
-url = "https://mirror.sjtu.edu.cn/pytorch-wheels/cpu"
-explicit = true
-
+# Official PyTorch index. The sjtu/aliyun/tuna `pytorch-wheels` mirrors all 404
+# now (they restructured), so we point at the canonical index directly.
 [[tool.uv.index]]
 name = "pytorch-cu126"
-url = "https://mirror.sjtu.edu.cn/pytorch-wheels/cu126"
+url = "https://download.pytorch.org/whl/cu126"
 explicit = true
 
 [tool.uv.sources]
-torch = [
-    { index = "pytorch-cpu", extra = "cpu" },
-    { index = "pytorch-cu126", extra = "cu126" },
-]
-torchvision = [
-    { index = "pytorch-cpu", extra = "cpu" },
-    { index = "pytorch-cu126", extra = "cu126" },
-]
+torch = [{ index = "pytorch-cu126" }]
+torchvision = [{ index = "pytorch-cu126" }]

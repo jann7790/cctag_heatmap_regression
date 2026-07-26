@@ -1,0 +1,56 @@
+# Task 2 — CCTag label quality vs distance (proxy = marker radius px)
+
+Source: /home/r13922171/dataset/outputs/datasets/6f_labeled
+Frames: 1073   detected(labelled): 807 (75.2%)   missed(no_detection): 266 (24.8%)
+Detected marker radius: min=59 median=122 max=1032 px
+
+Missed frames breakdown: isolated(gap<=3, distance knowable)=82   block-dropout(distance unknown)=184
+Top contiguous miss-runs (the real failure mode = whole-segment dropouts):
+    rank  959  len 114   20260606_224911 -> 20260606_225104
+    rank    0  len  27   20260606_221544 -> 20260606_221610
+    rank  902  len  23   20260606_224813 -> 20260606_224835
+    rank  522  len  18   20260606_224151 -> 20260606_224209
+    rank   67  len  15   20260606_221701 -> 20260606_221740
+    rank  116  len  10   20260606_222858 -> 20260606_222907
+    rank  309  len  10   20260606_223626 -> 20260606_223635
+    rank  784  len   8   20260606_224614 -> 20260606_224621
+
+Detection rate vs distance (detected + isolated misses only):
+  radius_bin_px        frames  detected  rate   (detected + isolated-miss only)
+  [   0,  80)           26       26    1.00
+  [  80, 120)          392      367    0.94
+  [ 120, 160)          109      105    0.96
+  [ 160, 220)           99       90    0.91
+  [ 220, 300)           83       72    0.87
+  [ 300, 450)           84       76    0.90
+  [ 450, 700)           87       68    0.78
+  [ 700,1100)            9        3    0.33
+
+INTERPRETATION: misses are dominated by contiguous block dropouts (dark/low-light end tail, setup start, dark mid-segments), NOT by far distance. Within the labelled distance range, far/small markers detect at high rate and their labels look accurate (see far_* samples).
+
+# Task 2.4 sample overlays (in data_diagnosis/task2_samples/)
+
+## NEAR (largest marker)
+  r=696px  near_r696_frame_20260606_221619.png
+  r=697px  near_r697_frame_20260606_221617.png
+  r=776px  near_r776_frame_20260606_224150.png
+  r=819px  near_r819_frame_20260606_221615.png
+  r=1032px  near_r1032_frame_20260606_221613.png
+## MID
+  r=122px  mid_r122_frame_20260606_224040.png
+  r=122px  mid_r122_frame_20260606_224649.png
+  r=122px  mid_r122_frame_20260606_224301.png
+  r=123px  mid_r122_frame_20260606_224846.png
+  r=123px  mid_r123_frame_20260606_223740.png
+## FAR (smallest marker)
+  r=59px  far_r58_frame_20260606_224734.png
+  r=69px  far_r68_frame_20260606_223759.png
+  r=73px  far_r72_frame_20260606_224731.png
+  r=73px  far_r72_frame_20260606_224732.png
+  r=73px  far_r73_frame_20260606_224730.png
+## MISSED (CCTag no_detection, full frame downscaled)
+  est_r~1032px  missed_frame_20260606_221544.png
+  est_r~92px  missed_frame_20260606_222904.png
+  est_r~297px  missed_frame_20260606_224527.png
+  est_r~571px  missed_frame_20260606_224918.png
+  est_r~571px  missed_frame_20260606_225011.png

@@ -21,6 +21,7 @@ Examples:
 """
 
 import argparse
+import contextlib
 import csv
 import json
 import logging
@@ -39,7 +40,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 from torch.nn.parallel import DistributedDataParallel
-from torch.utils.data import ConcatDataset, DataLoader, Dataset, Subset
+from torch.utils.data import ConcatDataset, DataLoader, Dataset, Sampler, Subset
 from torch.utils.data.distributed import DistributedSampler
 
 IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(3, 1, 1)
@@ -192,14 +193,20 @@ def parse_args() -> argparse.Namespace:
             "efficientnet_b0",
             "mobilenet_v3_small",
             "resnet18",
+            "resnet34",
+            "resnet50",
             "resnet18_hires",
             "hrnet_w18",
+            "hrnet_w18_small_v2",
         ],
-        help="Backbone architecture (default: resnet18). 'resnet18_hires' drops "
+        help="Backbone architecture (default: resnet18). 'resnet34'/'resnet50' "
+        "reuse the resnet18 U-Net decoder with wider/deeper encoders (resnet50 "
+        "has 4x wider bottleneck, ~2-3x params). 'resnet18_hires' drops "
         "the stem maxpool (2x finer encoder) and uses a double-conv decoder for "
         "sub-pixel localization; its checkpoints are not interchangeable with "
         "'resnet18'. 'hrnet_w18' uses timm ImageNet-pretrained HRNetV2 features "
-        "fused at stride 4.",
+        "fused at stride 4. 'hrnet_w18_small_v2' is the lighter HRNet variant "
+        "(fewer modules/blocks) for cheaper train/infer cost.",
     )
     parser.add_argument(
         "--align_corners",
@@ -253,6 +260,15 @@ def parse_args() -> argparse.Namespace:
         "higher sub-pixel capacity, directly targeting center-L2.",
     )
     parser.add_argument(
+        "--decoder_blocks",
+        type=int,
+        default=1,
+        help="Conv layers per U-Net decoder stage. 1 (default) = single "
+        "Conv3x3+BN+ReLU (legacy). 2 = double-conv stage for more decoder "
+        "capacity / sharper peaks. Applies to efficientnet/mobilenet/resnet18 "
+        "decoders; resnet18_hires is double-conv by design and ignores this.",
+    )
+    parser.add_argument(
         "--occ_loss_weight",
         type=float,
         default=0.0,
@@ -273,6 +289,27 @@ def parse_args() -> argparse.Namespace:
         help="Weight of the size smooth-L1 loss term. Default: 1.0.",
     )
     parser.add_argument(
+        "--dice_weight",
+        type=float,
+        default=0.5,
+        help="Heatmap term = (1 - dice_weight)*pixel + dice_weight*dice. "
+        "Default: 0.5 (reproduces original 50/50 blend). Lower values (e.g. 0.3) "
+        "increase per-pixel sharpness pressure.",
+    )
+    parser.add_argument(
+        "--concentration_weight",
+        type=float,
+        default=0.0,
+        help="Weight of the concentration penalty that pulls predicted mass "
+        "tight around the GT peak. 0.0 (default) disables it. Try 0.05.",
+    )
+    parser.add_argument(
+        "--concentration_window",
+        type=int,
+        default=7,
+        help="Odd window side for the concentration penalty patch. Default: 7.",
+    )
+    parser.add_argument(
         "--resume_from",
         type=Path,
         default=None,
@@ -288,6 +325,18 @@ def parse_args() -> argparse.Namespace:
         "is still computed in fp32 (BCELoss is unsafe under autocast). Only affects "
         "the training forward/backward; validation always runs fp32 so center_l2_px is "
         "not corrupted by the fp16 peak-plateau argmax bias.",
+    )
+    parser.add_argument(
+        "--grad_accum_steps",
+        type=int,
+        default=1,
+        help="Gradient accumulation: run this many micro-batches before each "
+        "optimizer step, so the effective global batch becomes "
+        "batch_size * world_size * grad_accum_steps without the memory cost of a "
+        "larger per-GPU batch. Useful for memory-bound backbones (e.g. HRNet at "
+        "1024x640). Default 1 (no accumulation). Note: BatchNorm statistics are "
+        "still computed per micro-batch, so this restores the optimizer's "
+        "effective batch but not large-batch BN behavior.",
     )
     parser.add_argument(
         "--channels_last",
@@ -349,6 +398,19 @@ def parse_args() -> argparse.Namespace:
         default=6.0,
         help="Max gaussian noise std (0-255 space) when --augment.",
     )
+    parser.add_argument(
+        "--scale_balanced_sampler",
+        action="store_true",
+        help="Build each training batch from labels.csv using 60%% positives and "
+        "40%% negatives by default. Positives are balanced across the fixed "
+        "48-80, 80-128, 128-192, and 192-320 px diameter bins.",
+    )
+    parser.add_argument(
+        "--positive_fraction",
+        type=float,
+        default=0.6,
+        help="Positive fraction per batch when --scale_balanced_sampler (default: 0.6).",
+    )
     args = parser.parse_args()
 
     # HRNet requires input dimensions divisible by 32 (5 × stride-2 stages).
@@ -394,15 +456,43 @@ def ensure_mobilenet_v3_small() -> tuple[Any, Any]:
     return mobilenet_v3_small, MobileNet_V3_Small_Weights
 
 
-def ensure_resnet18() -> tuple[Any, Any]:
+def ensure_resnet(variant: str = "resnet18") -> tuple[Any, Any]:
+    """Return (factory, weights_enum) for a torchvision ResNet variant."""
     try:
-        from torchvision.models import ResNet18_Weights, resnet18
+        import torchvision.models as tvm
     except ImportError as exc:
         raise SystemExit(
-            "torchvision is required for ResNet-18.\n"
+            "torchvision is required for ResNet backbones.\n"
             "Install it with: pip install torchvision"
         ) from exc
-    return resnet18, ResNet18_Weights
+    weights_enum = {
+        "resnet18": "ResNet18_Weights",
+        "resnet34": "ResNet34_Weights",
+        "resnet50": "ResNet50_Weights",
+    }[variant]
+    return getattr(tvm, variant), getattr(tvm, weights_enum)
+
+
+def ensure_resnet18() -> tuple[Any, Any]:
+    return ensure_resnet("resnet18")
+
+
+# Encoder stage channels (stem, layer1, layer2, layer3, layer4) per ResNet variant.
+RESNET_STAGE_CH: dict[str, tuple[int, int, int, int, int]] = {
+    "resnet18": (64, 64, 128, 256, 512),
+    "resnet34": (64, 64, 128, 256, 512),
+    "resnet50": (64, 256, 512, 1024, 2048),
+}
+
+# Decoder output widths (dec1..dec4) per variant. resnet18/34 keep the original
+# 256/128/64/32 (byte-identical decoder, checkpoints unchanged); resnet50 gets a
+# wider decoder so it can actually carry its 4x-wider encoder features instead of
+# being squashed to 256 at the first conv.
+DECODER_WIDTHS: dict[str, tuple[int, int, int, int]] = {
+    "resnet18": (256, 128, 64, 32),
+    "resnet34": (256, 128, 64, 32),
+    "resnet50": (512, 256, 128, 64),
+}
 
 
 def ensure_timm() -> Any:
@@ -525,6 +615,11 @@ class CCTagHeatmapDataset(Dataset[dict[str, Any]]):
                         "occlusion_ratio": float(row.get("occlusion_ratio") or 0.0),
                         "ellipse_a": float(row.get("ellipse_a") or 0.0),
                         "ellipse_b": float(row.get("ellipse_b") or 0.0),
+                        "is_negative": int(row.get("is_negative") or 0),
+                        "target_clamped": int(row.get("target_clamped") or 0),
+                        "visible_marker_ratio": float(
+                            row.get("visible_marker_ratio") or 1.0
+                        ),
                     }
                 )
 
@@ -601,6 +696,15 @@ class CCTagHeatmapDataset(Dataset[dict[str, Any]]):
             "center": center_tensor,
             "heatmap_center": heatmap_center_tensor,
             "size_target": size_target_tensor,
+            "marker_diameter": torch.tensor(
+                2.0 * max(float(sample["ellipse_a"]), float(sample["ellipse_b"])),
+                dtype=torch.float32,
+            ),
+            "is_boundary": torch.tensor(
+                bool(sample["target_clamped"])
+                or float(sample["visible_marker_ratio"]) < 0.999,
+                dtype=torch.bool,
+            ),
             "filename": sample["filename"],
             "occlusion_ratio": torch.tensor(
                 sample["occlusion_ratio"], dtype=torch.float32
@@ -692,6 +796,9 @@ class CombinedHeatmapLoss(nn.Module):
         offset_weight: float = 1.0,
         size_weight: float = 1.0,
         occ_weight_k: float = 0.0,
+        dice_weight: float = 0.5,
+        concentration_weight: float = 0.0,
+        concentration_window: int = 7,
     ) -> None:
         super().__init__()
         if use_focal:
@@ -708,6 +815,9 @@ class CombinedHeatmapLoss(nn.Module):
         # mean-normalized so the overall loss scale (hence effective LR) is
         # unchanged. k=0 disables it. Focuses learning on hard-occluded markers.
         self.occ_weight_k = occ_weight_k
+        self.dice_weight = dice_weight
+        self.concentration_weight = concentration_weight
+        self.concentration_window = concentration_window
 
     def _pixel_term(
         self, prediction: torch.Tensor, target: torch.Tensor
@@ -750,7 +860,7 @@ class CombinedHeatmapLoss(nn.Module):
         inter = (p2 * t2).sum(dim=1)
         den = p2.sum(dim=1) + t2.sum(dim=1)
         dice = 1.0 - (2.0 * inter + self.dice.smooth) / (den + self.dice.smooth)  # (B,)
-        per_sample = 0.5 * px + 0.5 * dice
+        per_sample = (1.0 - self.dice_weight) * px + self.dice_weight * dice
         w = 1.0 + self.occ_weight_k * occlusion_ratio
         w = w / w.mean().clamp(min=eps)
         return (w * per_sample).mean()
@@ -770,10 +880,41 @@ class CombinedHeatmapLoss(nn.Module):
                 prediction, target, occlusion_ratio
             )
         else:
-            heatmap_loss = 0.5 * self._pixel_term(prediction, target) + 0.5 * self.dice(
+            heatmap_loss = (1.0 - self.dice_weight) * self._pixel_term(
                 prediction, target
-            )
+            ) + self.dice_weight * self.dice(prediction, target)
         total = heatmap_loss
+
+        # Concentration penalty: penalise predicted mass spread around the GT
+        # peak.  For each positive sample, take a small window of the predicted
+        # heatmap centred on the GT peak cell and compute the mass-weighted
+        # second moment:  spread = sum(pred * dist2) / (sum(pred) + eps).
+        # Minimizing spread pulls the predicted peak tight → sharper heatmap.
+        if self.concentration_weight > 0.0 and heatmap_centers is not None:
+            pos_mask_c = target.flatten(1).max(dim=1).values > 0.1
+            if pos_mask_c.any():
+                centers_c = heatmap_centers[pos_mask_c]  # (P, 2) [x, y]
+                pred_c = prediction[pos_mask_c]  # (P, 1, H, W)
+                _, _, H_c, W_c = pred_c.shape
+                half = self.concentration_window // 2
+                spreads: list[torch.Tensor] = []
+                for i in range(centers_c.shape[0]):
+                    gx = int(centers_c[i, 0].round().item())
+                    gy = int(centers_c[i, 1].round().item())
+                    x0 = max(0, gx - half)
+                    x1 = min(W_c, gx + half + 1)
+                    y0 = max(0, gy - half)
+                    y1 = min(H_c, gy + half + 1)
+                    patch = pred_c[i, 0, y0:y1, x0:x1]  # (ph, pw)
+                    # Build coordinate offsets relative to GT peak
+                    dy = torch.arange(y0, y1, device=patch.device).float() - centers_c[i, 1]
+                    dx = torch.arange(x0, x1, device=patch.device).float() - centers_c[i, 0]
+                    dy_grid, dx_grid = torch.meshgrid(dy, dx, indexing="ij")
+                    dist2 = dx_grid ** 2 + dy_grid ** 2
+                    mass = patch.sum() + 1e-7
+                    spreads.append((patch * dist2).sum() / mass)
+                concentration_loss = torch.stack(spreads).mean()
+                total = total + self.concentration_weight * concentration_loss
 
         # Sub-pixel offset L1 loss (CenterNet-style), positives only. Supervise the
         # offset over a 3x3 neighborhood around the GT peak (not just round(center)):
@@ -884,6 +1025,7 @@ class CCTagNet(nn.Module):
         use_offset_head: bool = False,
         use_size_head: bool = False,
         offset_head_hidden: int = 0,
+        decoder_blocks: int = 1,
     ) -> None:
         super().__init__()
         efficientnet_b0, EfficientNet_B0_Weights = ensure_torchvision()
@@ -892,6 +1034,7 @@ class CCTagNet(nn.Module):
         self.heatmap_height, self.heatmap_width = heatmap_size
         self.use_offset_head = use_offset_head
         self.use_size_head = use_size_head
+        self.decoder_blocks = decoder_blocks
 
         # Decoder: 4 upsample stages with skip-connection concatenation
         # stage 1: up 32→16, cat features[4] (80ch)
@@ -909,13 +1052,21 @@ class CCTagNet(nn.Module):
         if use_size_head:
             self.size_head = nn.Conv2d(32, 2, kernel_size=1)
 
-    @staticmethod
-    def _dec_block(in_ch: int, out_ch: int) -> nn.Sequential:
-        return nn.Sequential(
+    def _dec_block(self, in_ch: int, out_ch: int) -> nn.Sequential:
+        # decoder_blocks=1 keeps the legacy single Conv3x3+BN+ReLU (identical
+        # state_dict keys); >1 stacks extra out_ch->out_ch convs for capacity.
+        layers: list[nn.Module] = [
             nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1),
             nn.BatchNorm2d(out_ch),
             nn.ReLU(inplace=True),
-        )
+        ]
+        for _ in range(max(1, self.decoder_blocks) - 1):
+            layers += [
+                nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1),
+                nn.BatchNorm2d(out_ch),
+                nn.ReLU(inplace=True),
+            ]
+        return nn.Sequential(*layers)
 
     def _encode(self, x: torch.Tensor) -> tuple[torch.Tensor, list[torch.Tensor]]:
         skips: list[torch.Tensor] = []
@@ -995,6 +1146,7 @@ class CCTagNetMobileV3(nn.Module):
         use_offset_head: bool = False,
         use_size_head: bool = False,
         offset_head_hidden: int = 0,
+        decoder_blocks: int = 1,
     ) -> None:
         super().__init__()
         mobilenet_v3_small, MobileNet_V3_Small_Weights = ensure_mobilenet_v3_small()
@@ -1003,6 +1155,7 @@ class CCTagNetMobileV3(nn.Module):
         self.heatmap_height, self.heatmap_width = heatmap_size
         self.use_offset_head = use_offset_head
         self.use_size_head = use_size_head
+        self.decoder_blocks = decoder_blocks
 
         self.dec1 = self._dec_block(self.BOTTLENECK_CHANNELS + 48, 128)
         self.dec2 = self._dec_block(128 + 24, 64)
@@ -1014,13 +1167,21 @@ class CCTagNetMobileV3(nn.Module):
         if use_size_head:
             self.size_head = nn.Conv2d(16, 2, kernel_size=1)
 
-    @staticmethod
-    def _dec_block(in_ch: int, out_ch: int) -> nn.Sequential:
-        return nn.Sequential(
+    def _dec_block(self, in_ch: int, out_ch: int) -> nn.Sequential:
+        # decoder_blocks=1 keeps the legacy single Conv3x3+BN+ReLU (identical
+        # state_dict keys); >1 stacks extra out_ch->out_ch convs for capacity.
+        layers: list[nn.Module] = [
             nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1),
             nn.BatchNorm2d(out_ch),
             nn.ReLU(inplace=True),
-        )
+        ]
+        for _ in range(max(1, self.decoder_blocks) - 1):
+            layers += [
+                nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1),
+                nn.BatchNorm2d(out_ch),
+                nn.ReLU(inplace=True),
+            ]
+        return nn.Sequential(*layers)
 
     def _encode(self, x: torch.Tensor) -> tuple[torch.Tensor, list[torch.Tensor]]:
         skips: list[torch.Tensor] = []
@@ -1094,10 +1255,12 @@ class CCTagNetResNet18(nn.Module):
         use_offset_head: bool = False,
         use_size_head: bool = False,
         offset_head_hidden: int = 0,
+        decoder_blocks: int = 1,
+        variant: str = "resnet18",
     ) -> None:
         super().__init__()
-        resnet18, ResNet18_Weights = ensure_resnet18()
-        backbone = resnet18(weights=ResNet18_Weights.DEFAULT)
+        factory, weights_enum = ensure_resnet(variant)
+        backbone = factory(weights=weights_enum.DEFAULT)
         self.stem = nn.Sequential(
             backbone.conv1,
             backbone.bn1,
@@ -1111,24 +1274,38 @@ class CCTagNetResNet18(nn.Module):
         self.heatmap_height, self.heatmap_width = heatmap_size
         self.use_offset_head = use_offset_head
         self.use_size_head = use_size_head
+        self.decoder_blocks = decoder_blocks
 
-        self.dec1 = self._dec_block(512 + 256, 256)
-        self.dec2 = self._dec_block(256 + 128, 128)
-        self.dec3 = self._dec_block(128 + 64, 64)
-        self.dec4 = self._dec_block(64 + 64, 32)
-        self.head = nn.Sequential(nn.Conv2d(32, 1, kernel_size=1), nn.Sigmoid())
+        # Skip-concat channels follow the encoder; decoder widths follow the
+        # variant (resnet18/34 keep 256/128/64/32; resnet50 is wider). Heads take
+        # the final decoder width so they stay consistent per variant.
+        c_stem, c1, c2, c3, c4 = RESNET_STAGE_CH[variant]
+        d1, d2, d3, d4 = DECODER_WIDTHS[variant]
+        self.dec1 = self._dec_block(c4 + c3, d1)
+        self.dec2 = self._dec_block(d1 + c2, d2)
+        self.dec3 = self._dec_block(d2 + c1, d3)
+        self.dec4 = self._dec_block(d3 + c_stem, d4)
+        self.head = nn.Sequential(nn.Conv2d(d4, 1, kernel_size=1), nn.Sigmoid())
         if use_offset_head:
-            self.offset_head = make_offset_head(32, offset_head_hidden)
+            self.offset_head = make_offset_head(d4, offset_head_hidden)
         if use_size_head:
-            self.size_head = nn.Conv2d(32, 2, kernel_size=1)
+            self.size_head = nn.Conv2d(d4, 2, kernel_size=1)
 
-    @staticmethod
-    def _dec_block(in_ch: int, out_ch: int) -> nn.Sequential:
-        return nn.Sequential(
+    def _dec_block(self, in_ch: int, out_ch: int) -> nn.Sequential:
+        # decoder_blocks=1 keeps the legacy single Conv3x3+BN+ReLU (identical
+        # state_dict keys); >1 stacks extra out_ch->out_ch convs for capacity.
+        layers: list[nn.Module] = [
             nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1),
             nn.BatchNorm2d(out_ch),
             nn.ReLU(inplace=True),
-        )
+        ]
+        for _ in range(max(1, self.decoder_blocks) - 1):
+            layers += [
+                nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1),
+                nn.BatchNorm2d(out_ch),
+                nn.ReLU(inplace=True),
+            ]
+        return nn.Sequential(*layers)
 
     @staticmethod
     def _up_cat(x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
@@ -1215,6 +1392,7 @@ class CCTagNetResNet18HiRes(nn.Module):
         use_offset_head: bool = False,
         use_size_head: bool = False,
         offset_head_hidden: int = 0,
+        decoder_blocks: int = 1,
     ) -> None:
         super().__init__()
         resnet18, ResNet18_Weights = ensure_resnet18()
@@ -1232,6 +1410,7 @@ class CCTagNetResNet18HiRes(nn.Module):
         self.heatmap_height, self.heatmap_width = heatmap_size
         self.use_offset_head = use_offset_head
         self.use_size_head = use_size_head
+        self.decoder_blocks = decoder_blocks
 
         self.dec1 = self._dec_block(512 + 256, 256)
         self.dec2 = self._dec_block(256 + 128, 128)
@@ -1328,6 +1507,7 @@ class CCTagNetHRNet(nn.Module):
         use_size_head: bool = False,
         pretrained: bool = True,
         offset_head_hidden: int = 0,
+        decoder_blocks: int = 1,
     ) -> None:
         super().__init__()
         timm = ensure_timm()
@@ -1353,6 +1533,7 @@ class CCTagNetHRNet(nn.Module):
         self.heatmap_height, self.heatmap_width = heatmap_size
         self.use_offset_head = use_offset_head
         self.use_size_head = use_size_head
+        self.decoder_blocks = decoder_blocks
         if use_offset_head:
             self.offset_head = make_offset_head(fuse_ch, offset_head_hidden)
         if use_size_head:
@@ -1444,6 +1625,124 @@ def get_dataset_heatmap_size(dataset: CCTagHeatmapDataset) -> tuple[int, int]:
     return dataset.heatmap_height, dataset.heatmap_width
 
 
+SCALE_BIN_EDGES = (48.0, 80.0, 128.0, 192.0, 320.0)
+SCALE_BIN_WEIGHTS = (0.30, 0.30, 0.20, 0.20)
+
+
+def get_sample_metadata(dataset: Dataset[Any], index: int) -> dict[str, Any]:
+    """Resolve metadata without loading image/heatmap data through wrappers."""
+    if isinstance(dataset, Subset):
+        return get_sample_metadata(dataset.dataset, int(dataset.indices[index]))
+    if isinstance(dataset, ConcatDataset):
+        dataset_index = int(np.searchsorted(dataset.cumulative_sizes, index, side="right"))
+        previous = 0 if dataset_index == 0 else dataset.cumulative_sizes[dataset_index - 1]
+        return get_sample_metadata(dataset.datasets[dataset_index], index - previous)
+    if isinstance(dataset, CCTagHeatmapDataset):
+        return dataset.samples[index]
+    raise TypeError(
+        "Scale-balanced sampling requires CCTagHeatmapDataset, Subset, or "
+        f"ConcatDataset; got {type(dataset).__name__}"
+    )
+
+
+class ScaleBalancedBatchSampler(Sampler[list[int]]):
+    """Replacement sampler with fixed positive/negative and marker-scale quotas."""
+
+    def __init__(
+        self,
+        dataset: Dataset[Any],
+        batch_size: int,
+        positive_fraction: float,
+        num_replicas: int,
+        rank: int,
+        seed: int,
+    ) -> None:
+        if batch_size < 2:
+            raise ValueError("--scale_balanced_sampler requires --batch_size >= 2")
+        if not 0.0 < positive_fraction < 1.0:
+            raise ValueError("--positive_fraction must be between 0 and 1")
+        self.batch_size = batch_size
+        self.num_replicas = num_replicas
+        self.rank = rank
+        self.seed = seed
+        self.epoch = 0
+        self.num_batches = max(1, math.ceil(len(dataset) / (batch_size * num_replicas)))
+        self.positive_count = min(
+            batch_size - 1, max(1, int(round(batch_size * positive_fraction)))
+        )
+        self.negative_count = batch_size - self.positive_count
+        self.scale_bins: list[list[int]] = [[] for _ in SCALE_BIN_WEIGHTS]
+        self.negative_indices: list[int] = []
+
+        for index in range(len(dataset)):
+            sample = get_sample_metadata(dataset, index)
+            if int(sample.get("is_negative", 0)) != 0:
+                self.negative_indices.append(index)
+                continue
+            diameter = 2.0 * max(
+                float(sample.get("ellipse_a", 0.0)),
+                float(sample.get("ellipse_b", 0.0)),
+            )
+            for bin_index, (low, high) in enumerate(
+                zip(SCALE_BIN_EDGES[:-1], SCALE_BIN_EDGES[1:])
+            ):
+                if low <= diameter < high or (
+                    bin_index == len(self.scale_bins) - 1 and diameter == high
+                ):
+                    self.scale_bins[bin_index].append(index)
+                    break
+
+        missing = [
+            f"{SCALE_BIN_EDGES[i]:g}-{SCALE_BIN_EDGES[i + 1]:g}"
+            for i, indices in enumerate(self.scale_bins)
+            if not indices
+        ]
+        if missing:
+            raise ValueError(
+                "Scale-balanced sampler found no positives in diameter bin(s): "
+                + ", ".join(missing)
+            )
+        if not self.negative_indices:
+            raise ValueError("Scale-balanced sampler found no negative samples")
+
+    def __len__(self) -> int:
+        return self.num_batches
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = epoch
+
+    def __iter__(self):
+        rng = random.Random(self.seed + self.epoch * self.num_replicas + self.rank)
+        allocated = [0] * len(SCALE_BIN_WEIGHTS)
+        for batch_index in range(self.num_batches):
+            cumulative_targets = [
+                (batch_index + 1) * self.positive_count * weight
+                for weight in SCALE_BIN_WEIGHTS
+            ]
+            bin_counts = [
+                max(0, math.floor(target) - allocated[i])
+                for i, target in enumerate(cumulative_targets)
+            ]
+            while sum(bin_counts) < self.positive_count:
+                best = max(
+                    range(len(bin_counts)),
+                    key=lambda i: cumulative_targets[i]
+                    - allocated[i]
+                    - bin_counts[i],
+                )
+                bin_counts[best] += 1
+
+            batch: list[int] = []
+            for bin_index, (indices, count) in enumerate(
+                zip(self.scale_bins, bin_counts)
+            ):
+                batch.extend(rng.choices(indices, k=count))
+                allocated[bin_index] += count
+            batch.extend(rng.choices(self.negative_indices, k=self.negative_count))
+            rng.shuffle(batch)
+            yield batch
+
+
 def build_dataset_collection(
     dataset_dirs: list[Path],
     input_size: tuple[int, int],
@@ -1509,7 +1808,7 @@ def create_dataloaders(
     DataLoader[Any],
     int,
     tuple[int, int],
-    DistributedSampler[Any] | None,
+    Sampler[Any] | None,
 ]:
     aug_cfg = build_augment_config(args)
     explicit_train_dirs, explicit_val_dirs = resolve_dataset_sources(args)
@@ -1575,9 +1874,20 @@ def create_dataloaders(
         dataset_size = len(train_base)
         heatmap_size = get_dataset_heatmap_size(train_base)
 
-    train_sampler = None
+    train_sampler: Sampler[Any] | None = None
     val_sampler = None
-    if world_size > 1:
+    train_batch_sampler = None
+    if args.scale_balanced_sampler:
+        train_batch_sampler = ScaleBalancedBatchSampler(
+            train_set,
+            batch_size=args.batch_size,
+            positive_fraction=args.positive_fraction,
+            num_replicas=world_size,
+            rank=rank,
+            seed=args.seed,
+        )
+        train_sampler = train_batch_sampler
+    elif world_size > 1:
         train_sampler = DistributedSampler(
             train_set,
             num_replicas=world_size,
@@ -1593,16 +1903,26 @@ def create_dataloaders(
             drop_last=False,
         )
 
-    train_loader = DataLoader(
-        train_set,
-        batch_size=args.batch_size,
-        shuffle=train_sampler is None,
-        sampler=train_sampler,
-        num_workers=args.num_workers,
-        pin_memory=torch.cuda.is_available(),
-        drop_last=False,
-        persistent_workers=args.num_workers > 0,
-    )
+    loader_kwargs = {
+        "num_workers": args.num_workers,
+        "pin_memory": torch.cuda.is_available(),
+        "persistent_workers": args.num_workers > 0,
+    }
+    if train_batch_sampler is not None:
+        train_loader = DataLoader(
+            train_set,
+            batch_sampler=train_batch_sampler,
+            **loader_kwargs,
+        )
+    else:
+        train_loader = DataLoader(
+            train_set,
+            batch_size=args.batch_size,
+            shuffle=train_sampler is None,
+            sampler=train_sampler,
+            drop_last=False,
+            **loader_kwargs,
+        )
     val_loader = DataLoader(
         val_set,
         batch_size=args.batch_size,
@@ -1763,12 +2083,17 @@ def train_one_epoch(
     scaler: "torch.amp.GradScaler | None" = None,
     use_amp: bool = False,
     channels_last: bool = False,
+    accum_steps: int = 1,
 ) -> float:
     model.train()
     running_loss = 0.0
     sample_count = 0
 
-    for batch in loader:
+    accum_steps = max(1, accum_steps)
+    num_batches = len(loader)
+    optimizer.zero_grad(set_to_none=True)
+
+    for step, batch in enumerate(loader):
         images = batch["image"].to(device, non_blocking=True)
         if channels_last:
             images = images.to(memory_format=torch.channels_last)
@@ -1781,7 +2106,17 @@ def train_one_epoch(
         if occlusion_ratio is not None:
             occlusion_ratio = occlusion_ratio.to(device, non_blocking=True)
 
-        optimizer.zero_grad(set_to_none=True)
+        # Step on every accum_steps-th micro-batch, and always on the final batch
+        # so a non-divisible tail still contributes its gradient.
+        is_step = ((step + 1) % accum_steps == 0) or (step + 1 == num_batches)
+        # Skip DDP's gradient all-reduce on non-stepping micro-batches (no_sync);
+        # gradients accumulate locally and sync only on the iteration that steps.
+        sync_ctx = (
+            model.no_sync()
+            if (not is_step and hasattr(model, "no_sync"))
+            else contextlib.nullcontext()
+        )
+
         # autocast only wraps the forward pass; the loss is computed in fp32 because
         # BCELoss is unsafe under fp16 autocast. Cast the fp16 outputs back to fp32.
         with torch.autocast(device_type=device.type, enabled=use_amp):
@@ -1799,13 +2134,20 @@ def train_one_epoch(
             size_target=size_target if size_pred is not None else None,
             occlusion_ratio=occlusion_ratio,
         )
-        if scaler is not None and scaler.is_enabled():
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            loss.backward()
-            optimizer.step()
+        # Average gradients over the accumulation window (mean-reduction loss).
+        scaled_loss = loss / accum_steps
+        with sync_ctx:
+            if scaler is not None and scaler.is_enabled():
+                scaler.scale(scaled_loss).backward()
+            else:
+                scaled_loss.backward()
+        if is_step:
+            if scaler is not None and scaler.is_enabled():
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
 
         batch_size = images.size(0)
         running_loss += tensor_to_float(loss) * batch_size
@@ -1835,6 +2177,17 @@ def validate(
     fp_det = 0
     fn_det = 0
     tn_det = 0
+    bin_gt = [0] * len(SCALE_BIN_WEIGHTS)
+    bin_detected = [0] * len(SCALE_BIN_WEIGHTS)
+    bin_peak_sum = [0.0] * len(SCALE_BIN_WEIGHTS)
+    bin_center_sum = [0.0] * len(SCALE_BIN_WEIGHTS)
+    bin_center_count = [0] * len(SCALE_BIN_WEIGHTS)
+    bin_full_gt = [0] * len(SCALE_BIN_WEIGHTS)
+    bin_full_detected = [0] * len(SCALE_BIN_WEIGHTS)
+    bin_boundary_gt = [0] * len(SCALE_BIN_WEIGHTS)
+    bin_boundary_detected = [0] * len(SCALE_BIN_WEIGHTS)
+    boundary_gt = 0
+    boundary_detected = 0
 
     for batch in loader:
         images = batch["image"].to(device, non_blocking=True)
@@ -1842,6 +2195,8 @@ def validate(
             images = images.to(memory_format=torch.channels_last)
         targets = batch["heatmap"].to(device, non_blocking=True)
         centers = batch["center"].to(device, non_blocking=True)
+        marker_diameters = batch["marker_diameter"].to(device, non_blocking=True)
+        is_boundary = batch["is_boundary"].to(device, non_blocking=True)
 
         # Always run the validation forward in fp32: under fp16 autocast the sigmoid
         # peak saturates to a flat plateau of identical 1.0 cells, so argmax decode
@@ -1866,6 +2221,48 @@ def validate(
         batch_tp, batch_fp, batch_fn, batch_tn = compute_detection_counts(
             predictions, targets
         )
+        pred_peaks = predictions.flatten(1).max(dim=1).values
+        detected_mask = pred_peaks >= 0.5
+        boundary_mask = torch.logical_and(pos_mask, is_boundary)
+        boundary_gt += int(boundary_mask.sum().item())
+        boundary_detected += int(
+            torch.logical_and(boundary_mask, detected_mask).sum().item()
+        )
+
+        for bin_index, (low, high) in enumerate(
+            zip(SCALE_BIN_EDGES[:-1], SCALE_BIN_EDGES[1:])
+        ):
+            in_bin = torch.logical_and(marker_diameters >= low, marker_diameters < high)
+            if bin_index == len(SCALE_BIN_WEIGHTS) - 1:
+                in_bin = torch.logical_and(marker_diameters >= low, marker_diameters <= high)
+            bin_mask = torch.logical_and(pos_mask, in_bin)
+            count = int(bin_mask.sum().item())
+            if count == 0:
+                continue
+            bin_gt[bin_index] += count
+            bin_detected[bin_index] += int(
+                torch.logical_and(bin_mask, detected_mask).sum().item()
+            )
+            bin_boundary_mask = torch.logical_and(bin_mask, is_boundary)
+            bin_full_mask = torch.logical_and(bin_mask, torch.logical_not(is_boundary))
+            bin_boundary_gt[bin_index] += int(bin_boundary_mask.sum().item())
+            bin_full_gt[bin_index] += int(bin_full_mask.sum().item())
+            bin_boundary_detected[bin_index] += int(
+                torch.logical_and(bin_boundary_mask, detected_mask).sum().item()
+            )
+            bin_full_detected[bin_index] += int(
+                torch.logical_and(bin_full_mask, detected_mask).sum().item()
+            )
+            bin_peak_sum[bin_index] += float(pred_peaks[bin_mask].sum().item())
+            offsets_bin = offset_pred[bin_mask] if offset_pred is not None else None
+            distance_sum, distance_count = compute_center_distance_sum(
+                predictions[bin_mask],
+                centers[bin_mask],
+                input_size,
+                offsets=offsets_bin,
+            )
+            bin_center_sum[bin_index] += distance_sum
+            bin_center_count[bin_index] += distance_count
 
         batch_size = images.size(0)
         running_loss += tensor_to_float(loss) * batch_size
@@ -1885,18 +2282,44 @@ def validate(
     total_fp = reduce_sum(float(fp_det), device)
     total_fn = reduce_sum(float(fn_det), device)
     total_tn = reduce_sum(float(tn_det), device)
+    total_boundary_gt = reduce_sum(float(boundary_gt), device)
+    total_boundary_detected = reduce_sum(float(boundary_detected), device)
 
     avg_loss = total_loss / max(total_count, 1.0)
     avg_center_error = total_center_distance / max(total_positive_count, 1.0)
     negative_false_positive_rate = safe_divide(total_fp, total_fp + total_tn)
     positive_detection_rate = safe_divide(total_tp, total_tp + total_fn)
 
-    return {
+    metrics = {
         "val_loss": avg_loss,
         "center_l2_px_positive_only": avg_center_error,
         "negative_false_positive_rate": negative_false_positive_rate,
         "positive_detection_rate": positive_detection_rate,
+        "tile_boundary_recall": safe_divide(
+            total_boundary_detected, total_boundary_gt
+        ),
     }
+    for bin_index, (low, high) in enumerate(
+        zip(SCALE_BIN_EDGES[:-1], SCALE_BIN_EDGES[1:])
+    ):
+        suffix = f"{int(low)}_{int(high)}"
+        total_bin_gt = reduce_sum(float(bin_gt[bin_index]), device)
+        total_bin_detected = reduce_sum(float(bin_detected[bin_index]), device)
+        total_bin_peak = reduce_sum(bin_peak_sum[bin_index], device)
+        total_bin_center = reduce_sum(bin_center_sum[bin_index], device)
+        total_bin_center_count = reduce_sum(float(bin_center_count[bin_index]), device)
+        total_full_gt = reduce_sum(float(bin_full_gt[bin_index]), device)
+        total_full_detected = reduce_sum(float(bin_full_detected[bin_index]), device)
+        total_boundary_bin_gt = reduce_sum(float(bin_boundary_gt[bin_index]), device)
+        total_boundary_bin_detected = reduce_sum(float(bin_boundary_detected[bin_index]), device)
+        metrics[f"recall_{suffix}"] = safe_divide(total_bin_detected, total_bin_gt)
+        metrics[f"full_recall_{suffix}"] = safe_divide(total_full_detected, total_full_gt)
+        metrics[f"boundary_recall_{suffix}"] = safe_divide(total_boundary_bin_detected, total_boundary_bin_gt)
+        metrics[f"peak_mean_{suffix}"] = safe_divide(total_bin_peak, total_bin_gt)
+        metrics[f"center_l2_px_{suffix}"] = safe_divide(
+            total_bin_center, total_bin_center_count
+        )
+    return metrics
 
 
 def _unwrap_model(model: nn.Module) -> nn.Module:
@@ -1974,9 +2397,15 @@ def write_run_config(
         "epochs": args.epochs,
         "batch_size_per_process": args.batch_size,
         "global_batch_size": args.batch_size * world_size,
+        "grad_accum_steps": args.grad_accum_steps,
+        "effective_global_batch_size": args.batch_size * world_size * args.grad_accum_steps,
         "lr": args.lr,
         "weight_decay": args.weight_decay,
         "train_ratio": args.train_ratio,
+        "scale_balanced_sampler": bool(args.scale_balanced_sampler),
+        "positive_fraction": float(args.positive_fraction),
+        "scale_bin_edges": list(SCALE_BIN_EDGES),
+        "scale_bin_weights": list(SCALE_BIN_WEIGHTS),
         "uses_explicit_train_val_datasets": bool(
             args.train_dataset_dirs or args.val_dataset_dirs
         ),
@@ -1986,11 +2415,15 @@ def write_run_config(
         "use_offset_head": bool(getattr(args, "offset_head", False)),
         "offset_weight": float(getattr(args, "offset_weight", 1.0)),
         "offset_head_hidden": int(getattr(args, "offset_head_hidden", 0)),
+        "decoder_blocks": int(getattr(args, "decoder_blocks", 1)),
         "use_size_head": bool(getattr(args, "size_head", False)),
         "size_weight": float(getattr(args, "size_weight", 1.0)),
         "use_focal": bool(getattr(args, "focal_loss", False)),
         "backbone": getattr(args, "backbone", "efficientnet_b0"),
         "align_corners": bool(getattr(args, "align_corners", False)),
+        "dice_weight": float(getattr(args, "dice_weight", 0.5)),
+        "concentration_weight": float(getattr(args, "concentration_weight", 0.0)),
+        "concentration_window": int(getattr(args, "concentration_window", 7)),
     }
     (output_dir / "run_config.json").write_text(
         json.dumps(config, indent=2), encoding="utf-8"
@@ -2008,6 +2441,11 @@ def append_metrics_row(
     if not is_main_process():
         return
     is_new = not metrics_path.exists()
+    scale_metric_keys = [
+        f"{metric}_{int(low)}_{int(high)}"
+        for low, high in zip(SCALE_BIN_EDGES[:-1], SCALE_BIN_EDGES[1:])
+        for metric in ("recall", "full_recall", "boundary_recall", "peak_mean", "center_l2_px")
+    ]
     with metrics_path.open("a", encoding="utf-8", newline="") as handle:
         writer = csv.writer(handle)
         if is_new:
@@ -2019,6 +2457,8 @@ def append_metrics_row(
                     "center_l2_px_positive_only",
                     "negative_false_positive_rate",
                     "positive_detection_rate",
+                    "tile_boundary_recall",
+                    *scale_metric_keys,
                     "lr",
                     "duration_sec",
                 ]
@@ -2031,6 +2471,8 @@ def append_metrics_row(
                 f"{val_metrics['center_l2_px_positive_only']:.4f}",
                 f"{val_metrics['negative_false_positive_rate']:.6f}",
                 f"{val_metrics['positive_detection_rate']:.6f}",
+                f"{val_metrics['tile_boundary_recall']:.6f}",
+                *[f"{val_metrics[key]:.6f}" for key in scale_metric_keys],
                 f"{lr:.8f}",
                 f"{duration_sec:.2f}",
             ]
@@ -2103,6 +2545,7 @@ def build_model(
     use_offset_head: bool = False,
     use_size_head: bool = False,
     offset_head_hidden: int = 0,
+    decoder_blocks: int = 1,
     channels_last: bool = False,
 ) -> nn.Module:
     # Rank 0 loads pretrained weights first so other ranks can reuse the local cache.
@@ -2112,16 +2555,19 @@ def build_model(
         "use_offset_head": use_offset_head,
         "use_size_head": use_size_head,
         "offset_head_hidden": offset_head_hidden,
+        "decoder_blocks": decoder_blocks,
     }
     if backbone == "mobilenet_v3_small":
         model = CCTagNetMobileV3(heatmap_size=heatmap_size, **head_kwargs).to(device)
-    elif backbone == "resnet18":
-        model = CCTagNetResNet18(heatmap_size=heatmap_size, **head_kwargs).to(device)
+    elif backbone in ("resnet18", "resnet34", "resnet50"):
+        model = CCTagNetResNet18(
+            heatmap_size=heatmap_size, variant=backbone, **head_kwargs
+        ).to(device)
     elif backbone == "resnet18_hires":
         model = CCTagNetResNet18HiRes(heatmap_size=heatmap_size, **head_kwargs).to(
             device
         )
-    elif backbone == "hrnet_w18":
+    elif backbone in ("hrnet_w18", "hrnet_w18_small_v2"):
         model = CCTagNetHRNet(
             heatmap_size=heatmap_size, variant=backbone, **head_kwargs
         ).to(device)
@@ -2186,6 +2632,7 @@ def main() -> None:
         use_offset_head=args.offset_head,
         use_size_head=args.size_head,
         offset_head_hidden=args.offset_head_hidden,
+        decoder_blocks=args.decoder_blocks,
         channels_last=args.channels_last,
     )
     if args.resume_from is not None:
@@ -2215,6 +2662,9 @@ def main() -> None:
         offset_weight=args.offset_weight,
         size_weight=args.size_weight,
         occ_weight_k=args.occ_loss_weight,
+        dice_weight=args.dice_weight,
+        concentration_weight=args.concentration_weight,
+        concentration_window=args.concentration_window,
     ).to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -2252,6 +2702,8 @@ def main() -> None:
             f"samples={dataset_size} train={train_size} val={val_size} "
             f"input={args.input_width}x{args.input_height} heatmap={heatmap_size[1]}x{heatmap_size[0]} "
             f"per_gpu_batch={args.batch_size} global_batch={args.batch_size * world_size}"
+            f" accum_steps={args.grad_accum_steps}"
+            f" effective_global_batch={args.batch_size * world_size * args.grad_accum_steps}"
         )
 
     for epoch in range(1, args.epochs + 1):
@@ -2268,6 +2720,7 @@ def main() -> None:
             scaler=scaler,
             use_amp=use_amp,
             channels_last=args.channels_last,
+            accum_steps=args.grad_accum_steps,
         )
         val_metrics = validate(
             model,

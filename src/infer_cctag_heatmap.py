@@ -80,11 +80,22 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--compile", action="store_true", help="Use torch.compile() for faster inference (slow first run).")
     parser.add_argument("--amp", action="store_true", help="(Deprecated/ignored) fp16 corrupts center localization via peak-plateau argmax bias; inference always decodes in fp32.")
+    parser.add_argument("--force_fp16_unsafe", action="store_true",
+                        help="MEASUREMENT/DEBUG ONLY: actually run the forward in fp16 autocast "
+                             "(unlike --amp, which is ignored). Use to quantify the fp16/ANE "
+                             "peak-plateau localization degradation vs fp32. Never use in production.")
     parser.add_argument("--batch_size", type=int, default=1, help="Batch size for inference (default: 1).")
     parser.add_argument("--decode_method", type=str, default="weighted",
-                        choices=["weighted", "subpixel", "argmax"],
+                        choices=["weighted", "subpixel", "argmax", "softargmax"],
                         help="Peak localization method: 'weighted' (weighted centroid, default), "
-                             "'subpixel' (Hessian refinement), 'argmax' (integer grid).")
+                             "'subpixel' (Hessian refinement), 'argmax' (integer grid), "
+                             "'softargmax' (softmax-weighted expected coord; fp16/ANE-safe, "
+                             "no plateau corner bias).")
+    parser.add_argument("--softargmax_radius", type=int, default=5,
+                        help="Local window radius for --decode_method softargmax (default: 5).")
+    parser.add_argument("--softargmax_temp", type=float, default=1.0,
+                        help="Softmax temperature for --decode_method softargmax. Lower = sharper "
+                             "(closer to argmax), higher = smoother (default: 1.0).")
     parser.add_argument("--min_peak_sharpness", type=float, default=0.0,
                         help="Minimum peak sharpness ratio (peak / mean of top region) to accept a detection. "
                              "Real CCTags produce sharp peaks (ratio > 3); false positives from overexposure "
@@ -124,12 +135,36 @@ def ensure_mobilenet_v3_small():
     return mobilenet_v3_small, MobileNet_V3_Small_Weights
 
 
-def ensure_resnet18():
+def ensure_resnet(variant: str = "resnet18"):
     try:
-        from torchvision.models import ResNet18_Weights, resnet18
+        import torchvision.models as tvm
     except ImportError as exc:
         raise SystemExit("pip install torchvision") from exc
-    return resnet18, ResNet18_Weights
+    weights_enum = {
+        "resnet18": "ResNet18_Weights",
+        "resnet34": "ResNet34_Weights",
+        "resnet50": "ResNet50_Weights",
+    }[variant]
+    return getattr(tvm, variant), getattr(tvm, weights_enum)
+
+
+def ensure_resnet18():
+    return ensure_resnet("resnet18")
+
+
+# Encoder stage channels (stem, layer1, layer2, layer3, layer4) per ResNet variant.
+RESNET_STAGE_CH = {
+    "resnet18": (64, 64, 128, 256, 512),
+    "resnet34": (64, 64, 128, 256, 512),
+    "resnet50": (64, 256, 512, 1024, 2048),
+}
+
+# Decoder output widths (dec1..dec4) per variant -- must match training.
+DECODER_WIDTHS = {
+    "resnet18": (256, 128, 64, 32),
+    "resnet34": (256, 128, 64, 32),
+    "resnet50": (512, 256, 128, 64),
+}
 
 
 def ensure_timm() -> Any:
@@ -161,7 +196,8 @@ def make_offset_head(in_ch: int, hidden: int = 0) -> nn.Module:
 
 class CCTagNet(nn.Module):
     def __init__(self, heatmap_size: tuple[int, int], use_offset_head: bool = False,
-                 use_size_head: bool = False, offset_head_hidden: int = 0) -> None:
+                 use_size_head: bool = False, offset_head_hidden: int = 0,
+                 decoder_blocks: int = 1) -> None:
         super().__init__()
         efficientnet_b0, EfficientNet_B0_Weights = ensure_torchvision()
         backbone = efficientnet_b0(weights=None)
@@ -169,6 +205,7 @@ class CCTagNet(nn.Module):
         self.heatmap_height, self.heatmap_width = heatmap_size
         self.use_offset_head = use_offset_head
         self.use_size_head = use_size_head
+        self.decoder_blocks = decoder_blocks
         self.decoder = nn.Sequential(
             nn.Upsample(scale_factor=2, mode="bilinear", align_corners=DECODE_ALIGN_CORNERS),
             nn.Conv2d(1280, 256, kernel_size=3, padding=1), nn.BatchNorm2d(256), nn.ReLU(inplace=True),
@@ -209,13 +246,23 @@ class CCTagNetV3(nn.Module):
         self.dec4 = self._dec_block(64 + 16, 32)
         self.head = nn.Sequential(nn.Conv2d(32, 1, kernel_size=1), nn.Sigmoid())
 
-    @staticmethod
-    def _dec_block(in_ch: int, out_ch: int) -> nn.Sequential:
-        return nn.Sequential(
+    def _dec_block(self, in_ch: int, out_ch: int) -> nn.Sequential:
+        # Mirrors training: decoder_blocks=1 -> single conv (legacy keys);
+        # >1 stacks extra out_ch->out_ch convs. getattr keeps legacy classes
+        # that never set decoder_blocks at single-conv.
+        n = max(1, getattr(self, "decoder_blocks", 1))
+        layers: list[nn.Module] = [
             nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1),
             nn.BatchNorm2d(out_ch),
             nn.ReLU(inplace=True),
-        )
+        ]
+        for _ in range(n - 1):
+            layers += [
+                nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1),
+                nn.BatchNorm2d(out_ch),
+                nn.ReLU(inplace=True),
+            ]
+        return nn.Sequential(*layers)
 
     def _encode(self, x: torch.Tensor) -> tuple[torch.Tensor, list[torch.Tensor]]:
         skips: list[torch.Tensor] = []
@@ -252,7 +299,8 @@ class CCTagNetMobileV3(nn.Module):
     BOTTLENECK_CHANNELS = 576
 
     def __init__(self, heatmap_size: tuple[int, int], use_offset_head: bool = False,
-                 use_size_head: bool = False, offset_head_hidden: int = 0) -> None:
+                 use_size_head: bool = False, offset_head_hidden: int = 0,
+                 decoder_blocks: int = 1) -> None:
         super().__init__()
         mobilenet_v3_small, _ = ensure_mobilenet_v3_small()
         backbone = mobilenet_v3_small(weights=None)
@@ -260,6 +308,7 @@ class CCTagNetMobileV3(nn.Module):
         self.heatmap_height, self.heatmap_width = heatmap_size
         self.use_offset_head = use_offset_head
         self.use_size_head = use_size_head
+        self.decoder_blocks = decoder_blocks
 
         self.dec1 = self._dec_block(self.BOTTLENECK_CHANNELS + 48, 128)
         self.dec2 = self._dec_block(128 + 24, 64)
@@ -271,13 +320,23 @@ class CCTagNetMobileV3(nn.Module):
         if use_size_head:
             self.size_head = nn.Conv2d(16, 2, kernel_size=1)
 
-    @staticmethod
-    def _dec_block(in_ch: int, out_ch: int) -> nn.Sequential:
-        return nn.Sequential(
+    def _dec_block(self, in_ch: int, out_ch: int) -> nn.Sequential:
+        # Mirrors training: decoder_blocks=1 -> single conv (legacy keys);
+        # >1 stacks extra out_ch->out_ch convs. getattr keeps legacy classes
+        # that never set decoder_blocks at single-conv.
+        n = max(1, getattr(self, "decoder_blocks", 1))
+        layers: list[nn.Module] = [
             nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1),
             nn.BatchNorm2d(out_ch),
             nn.ReLU(inplace=True),
-        )
+        ]
+        for _ in range(n - 1):
+            layers += [
+                nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1),
+                nn.BatchNorm2d(out_ch),
+                nn.ReLU(inplace=True),
+            ]
+        return nn.Sequential(*layers)
 
     def _encode(self, x: torch.Tensor) -> tuple[torch.Tensor, list[torch.Tensor]]:
         skips: list[torch.Tensor] = []
@@ -353,21 +412,31 @@ def load_model(checkpoint_path: Path, device: torch.device) -> tuple[nn.Module, 
         offset_head_hidden = int(state["offset_head.0.weight"].shape[0])
     elif "offset_head.weight" in state:
         offset_head_hidden = 0
+    # Recover decoder depth: a double-conv stage stores dec1.3.weight (the 2nd
+    # conv); single-conv has only dec1.0.weight. Prefer the weight shape over the
+    # config field so older checkpoints rebuild correctly.
+    decoder_blocks = int(config.get("decoder_blocks", 1))
+    if "dec1.3.weight" in state:
+        decoder_blocks = max(decoder_blocks, 2)
     config["use_offset_head"] = use_offset_head
     config["use_size_head"] = use_size_head
     config["offset_head_hidden"] = offset_head_hidden
+    config["decoder_blocks"] = decoder_blocks
     head_kwargs = {
         "use_offset_head": use_offset_head,
         "use_size_head": use_size_head,
         "offset_head_hidden": offset_head_hidden,
+        "decoder_blocks": decoder_blocks,
     }
     if backbone == "mobilenet_v3_small":
         model = CCTagNetMobileV3(heatmap_size=heatmap_size, **head_kwargs).to(device)
-    elif backbone == "resnet18":
-        model = CCTagNetResNet18(heatmap_size=heatmap_size, **head_kwargs).to(device)
+    elif backbone in ("resnet18", "resnet34", "resnet50"):
+        model = CCTagNetResNet18(
+            heatmap_size=heatmap_size, variant=backbone, **head_kwargs
+        ).to(device)
     elif backbone == "resnet18_hires":
         model = CCTagNetResNet18HiRes(heatmap_size=heatmap_size, **head_kwargs).to(device)
-    elif backbone == "hrnet_w18":
+    elif backbone.startswith("hrnet"):
         model = CCTagNetHRNet(
             heatmap_size=heatmap_size, variant=backbone, **head_kwargs
         ).to(device)
@@ -446,14 +515,35 @@ def decode_center_subpixel(heatmap: np.ndarray, threshold: float = 0.3) -> tuple
     return float(px) + delta_x, float(py) + delta_y
 
 
-def decode_center_offset(heatmap: np.ndarray, offset: np.ndarray, threshold: float = 0.3) -> tuple[float, float] | None:
-    """Argmax peak + predicted (dx, dy) offset at that pixel (CenterNet style)."""
+def decode_center_offset(
+    heatmap: np.ndarray,
+    offset: np.ndarray,
+    threshold: float = 0.3,
+    soft_peak: bool = False,
+    radius: int = 5,
+    temperature: float = 1.0,
+) -> tuple[float, float] | None:
+    """Peak pixel + predicted (dx, dy) offset at that pixel (CenterNet style).
+
+    With soft_peak=False the peak pixel is the hard argmax (original behavior).
+    Under fp16 the sigmoid peak saturates to a flat 1.0 plateau and argmax snaps
+    to its top-left corner; the offset is then read at the WRONG pixel, so the
+    correction is applied from the wrong base and localization degrades. With
+    soft_peak=True the peak pixel is located by soft-argmax (plateau-robust) and
+    rounded to the nearest cell before reading the offset -- this is the fp16/ANE
+    -safe variant.
+    """
     peak_val = float(heatmap.max())
     if peak_val < threshold:
         return None
     h, w = heatmap.shape
-    flat_idx = int(np.argmax(heatmap))
-    py, px = divmod(flat_idx, w)
+    if soft_peak:
+        cx_s, cy_s = _soft_argmax_xy(heatmap, radius=radius, temperature=temperature, from_logits=True)
+        px = int(min(max(round(cx_s), 0), w - 1))
+        py = int(min(max(round(cy_s), 0), h - 1))
+    else:
+        flat_idx = int(np.argmax(heatmap))
+        py, px = divmod(flat_idx, w)
     dx = float(offset[0, py, px])
     dy = float(offset[1, py, px])
     return float(px) + dx, float(py) + dy
@@ -501,6 +591,77 @@ def decode_center_weighted(heatmap: np.ndarray, threshold: float = 0.3, radius: 
     cx = float((xx * region).sum() / total)
     cy = float((yy * region).sum() / total)
     return cx, cy
+
+
+def _soft_argmax_xy(
+    heatmap: np.ndarray,
+    radius: int = 5,
+    temperature: float = 1.0,
+    from_logits: bool = True,
+) -> tuple[float, float]:
+    """Softmax-weighted expected (x, y) in a local window around the argmax peak.
+
+    Tie-robust core shared by the heatmap and offset-head decoders: a symmetric
+    saturated plateau averages to its geometric center instead of snapping to a
+    corner. Assumes the caller already checked the peak passes threshold.
+    """
+    h, w = heatmap.shape
+    flat_idx = int(np.argmax(heatmap))
+    py, px = divmod(flat_idx, w)
+
+    y0 = max(0, py - radius)
+    y1 = min(h, py + radius + 1)
+    x0 = max(0, px - radius)
+    x1 = min(w, px + radius + 1)
+
+    region = heatmap[y0:y1, x0:x1].astype(np.float64)
+    if from_logits:
+        # Recover logits from sigmoid probabilities; clamp to avoid +/-inf at the
+        # saturated ends (logit(1.0) = inf). Must run in fp32+ -- this is exactly
+        # the information that fp16 destroys when the plateau is baked in upstream.
+        p = np.clip(region, 1e-6, 1.0 - 1e-6)
+        scores = np.log(p / (1.0 - p))
+    else:
+        scores = region
+
+    scores = scores / max(temperature, 1e-6)
+    scores -= scores.max()  # numerical stability
+    weights = np.exp(scores)
+    total = weights.sum()
+    if total < 1e-12:
+        return float(px), float(py)
+
+    yy, xx = np.mgrid[y0:y1, x0:x1]
+    cx = float((xx * weights).sum() / total)
+    cy = float((yy * weights).sum() / total)
+    return cx, cy
+
+
+def decode_center_softargmax(
+    heatmap: np.ndarray,
+    threshold: float = 0.3,
+    radius: int = 5,
+    temperature: float = 1.0,
+    from_logits: bool = True,
+) -> tuple[float, float] | None:
+    """Return (x, y) via soft-argmax (softmax-weighted expected coordinate).
+
+    Unlike argmax / weighted-centroid, this never tie-breaks toward a plateau
+    corner: a symmetric saturated peak averages to its geometric center. This is
+    the fp16/ANE-safe decode -- on Apple Neural Engine the sigmoid peak saturates
+    into a flat 1.0 plateau and hard argmax snaps to the top-left, biasing the
+    center toward the origin (~14px at 1024x640).
+
+    With from_logits=True the probabilities are mapped back to logits via the
+    inverse sigmoid before the softmax, which keeps the peak sharp (a softmax over
+    [0, 1] probabilities is far too flat) and matches a deployment graph that
+    exports pre-sigmoid logits. The local window (radius) keeps distant spurious
+    activations from pulling the centroid.
+    """
+    peak_val = float(heatmap.max())
+    if peak_val < threshold:
+        return None
+    return _soft_argmax_xy(heatmap, radius=radius, temperature=temperature, from_logits=from_logits)
 
 
 def compute_peak_sharpness(heatmap: np.ndarray, radius: int = 5) -> float:
@@ -553,10 +714,11 @@ class CCTagNetResNet18(nn.Module):
     """
 
     def __init__(self, heatmap_size: tuple[int, int], use_offset_head: bool = False,
-                 use_size_head: bool = False, offset_head_hidden: int = 0) -> None:
+                 use_size_head: bool = False, offset_head_hidden: int = 0,
+                 decoder_blocks: int = 1, variant: str = "resnet18") -> None:
         super().__init__()
-        resnet18, ResNet18_Weights = ensure_resnet18()
-        backbone = resnet18(weights=None)
+        factory, _ = ensure_resnet(variant)
+        backbone = factory(weights=None)
         self.stem = nn.Sequential(backbone.conv1, backbone.bn1, backbone.relu)
         self.maxpool = backbone.maxpool
         self.layer1 = backbone.layer1
@@ -566,24 +728,38 @@ class CCTagNetResNet18(nn.Module):
         self.heatmap_height, self.heatmap_width = heatmap_size
         self.use_offset_head = use_offset_head
         self.use_size_head = use_size_head
+        self.decoder_blocks = decoder_blocks
 
-        self.dec1 = self._dec_block(512 + 256, 256)
-        self.dec2 = self._dec_block(256 + 128, 128)
-        self.dec3 = self._dec_block(128 + 64, 64)
-        self.dec4 = self._dec_block(64 + 64, 32)
-        self.head = nn.Sequential(nn.Conv2d(32, 1, kernel_size=1), nn.Sigmoid())
+        # Skip-concat channels follow the encoder; decoder widths follow the variant.
+        c_stem, c1, c2, c3, c4 = RESNET_STAGE_CH[variant]
+        d1, d2, d3, d4 = DECODER_WIDTHS[variant]
+        self.dec1 = self._dec_block(c4 + c3, d1)
+        self.dec2 = self._dec_block(d1 + c2, d2)
+        self.dec3 = self._dec_block(d2 + c1, d3)
+        self.dec4 = self._dec_block(d3 + c_stem, d4)
+        self.head = nn.Sequential(nn.Conv2d(d4, 1, kernel_size=1), nn.Sigmoid())
         if use_offset_head:
-            self.offset_head = make_offset_head(32, offset_head_hidden)
+            self.offset_head = make_offset_head(d4, offset_head_hidden)
         if use_size_head:
-            self.size_head = nn.Conv2d(32, 2, kernel_size=1)
+            self.size_head = nn.Conv2d(d4, 2, kernel_size=1)
 
-    @staticmethod
-    def _dec_block(in_ch: int, out_ch: int) -> nn.Sequential:
-        return nn.Sequential(
+    def _dec_block(self, in_ch: int, out_ch: int) -> nn.Sequential:
+        # Mirrors training: decoder_blocks=1 -> single conv (legacy keys);
+        # >1 stacks extra out_ch->out_ch convs. getattr keeps legacy classes
+        # that never set decoder_blocks at single-conv.
+        n = max(1, getattr(self, "decoder_blocks", 1))
+        layers: list[nn.Module] = [
             nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1),
             nn.BatchNorm2d(out_ch),
             nn.ReLU(inplace=True),
-        )
+        ]
+        for _ in range(n - 1):
+            layers += [
+                nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1),
+                nn.BatchNorm2d(out_ch),
+                nn.ReLU(inplace=True),
+            ]
+        return nn.Sequential(*layers)
 
     @staticmethod
     def _up_cat(x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
@@ -646,7 +822,8 @@ class CCTagNetResNet18HiRes(nn.Module):
     """
 
     def __init__(self, heatmap_size: tuple[int, int], use_offset_head: bool = False,
-                 use_size_head: bool = False, offset_head_hidden: int = 0) -> None:
+                 use_size_head: bool = False, offset_head_hidden: int = 0,
+                 decoder_blocks: int = 1) -> None:
         super().__init__()
         resnet18, ResNet18_Weights = ensure_resnet18()
         backbone = resnet18(weights=None)
@@ -659,6 +836,7 @@ class CCTagNetResNet18HiRes(nn.Module):
         self.heatmap_height, self.heatmap_width = heatmap_size
         self.use_offset_head = use_offset_head
         self.use_size_head = use_size_head
+        self.decoder_blocks = decoder_blocks
 
         self.dec1 = self._dec_block(512 + 256, 256)
         self.dec2 = self._dec_block(256 + 128, 128)
@@ -735,6 +913,7 @@ class CCTagNetHRNet(nn.Module):
         use_size_head: bool = False,
         pretrained: bool = False,
         offset_head_hidden: int = 0,
+        decoder_blocks: int = 1,
     ) -> None:
         super().__init__()
         timm = ensure_timm()
@@ -761,6 +940,7 @@ class CCTagNetHRNet(nn.Module):
         self.heatmap_height, self.heatmap_width = heatmap_size
         self.use_offset_head = use_offset_head
         self.use_size_head = use_size_head
+        self.decoder_blocks = decoder_blocks
         if use_offset_head:
             self.offset_head = make_offset_head(fuse_ch, offset_head_hidden)
         if use_size_head:
@@ -1094,6 +1274,11 @@ def main() -> None:
         print("warning: --amp ignored for inference — fp16 corrupts center "
               "localization (peak-plateau argmax bias). Running forward in fp32.")
     use_amp = False
+    if args.force_fp16_unsafe and device.type == "cuda":
+        print("WARNING: --force_fp16_unsafe — running forward in fp16 autocast. "
+              "This is a measurement-only path; localization will be degraded by "
+              "the peak-plateau argmax bias. Do not use in production.")
+        use_amp = True
 
     detection_log: list[dict[str, Any]] = []
 
@@ -1103,7 +1288,19 @@ def main() -> None:
         """Post-process a single image: print result, save outputs, evaluate."""
         peak_val = float(heatmap.max())
         if offset is not None:
-            result = decode_center_offset(heatmap, offset, threshold=args.threshold)
+            result = decode_center_offset(
+                heatmap, offset, threshold=args.threshold,
+                soft_peak=(args.decode_method == "softargmax"),
+                radius=args.softargmax_radius,
+                temperature=args.softargmax_temp,
+            )
+        elif args.decode_method == "softargmax":
+            result = decode_center_softargmax(
+                heatmap,
+                threshold=args.threshold,
+                radius=args.softargmax_radius,
+                temperature=args.softargmax_temp,
+            )
         elif args.decode_method == "weighted":
             result = decode_center_weighted(heatmap, threshold=args.threshold)
         elif args.decode_method == "subpixel":

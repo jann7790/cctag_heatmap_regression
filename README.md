@@ -75,11 +75,10 @@ uv sync --extra cu126
 uv sync --extra cu126
 ```
 
-如果這台機器沒有可用 CUDA，改用 CPU 版本：
-
-```bash
-uv sync --extra cpu
-```
+> torch 已改為固定 `2.11.0+cu126` 的基礎依賴（Linux GPU-only），不再是 optional
+> extra。CPU-only 安裝已移除：以前沒帶 `--extra` 跑 `uv` 會讓 torch 從 pypi.org 解到
+> 依賴 cu13 的通用版而弄壞 cuDNN，固定 cu126 後這個漏洞就根絕了。`--extra cu126`
+> 仍可用(保留為 no-op alias)。
 
 也可以用 bootstrap script：
 
